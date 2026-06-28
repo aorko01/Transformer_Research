@@ -1,0 +1,910 @@
+{
+  "model": "bert-small",
+  "params_M": 28.8,
+  "device": "cpu",
+  "bert_config": {
+    "hidden_size": 512,
+    "num_hidden_layers": 4,
+    "num_attention_heads": 8,
+    "intermediate_size": 2048,
+    "hidden_act": "gelu",
+    "hidden_dropout_prob": 0.1,
+    "attention_probs_dropout_prob": 0.1,
+    "max_position_embeddings": 512,
+    "type_vocab_size": 2,
+    "initializer_range": 0.02,
+    "layer_norm_eps": 1e-12,
+    "vocab_size": 30522
+  },
+  "training_cfg": {
+    "mlm_probability": 0.15,
+    "learning_rate": 0.0001,
+    "weight_decay": 0.01,
+    "adam_beta1": 0.9,
+    "adam_beta2": 0.999,
+    "adam_epsilon": 1e-06,
+    "max_grad_norm": 1.0,
+    "warmup_steps": 10000,
+    "batch_size": 8,
+    "max_seq_length": 64,
+    "num_epochs": 2,
+    "max_train_samples": 200,
+    "max_val_samples": 40
+  },
+  "custom_attention": "none",
+  "started_at": "2026-06-28T10:18:56.336229",
+  "epochs": [
+    {
+      "epoch": 1,
+      "train": {
+        "loss": 3.550135,
+        "masked_token_accuracy": 0.848977,
+        "perplexity": 34.818,
+        "epoch_time_sec": 31.7,
+        "batches": 25
+      },
+      "val": {
+        "loss": 0.62253,
+        "masked_token_accuracy": 1.0,
+        "perplexity": 1.8636,
+        "epoch_time_sec": 1.76,
+        "batches": 3
+      }
+    },
+    {
+      "epoch": 2,
+      "train": {
+        "loss": 0.471204,
+        "masked_token_accuracy": 1.0,
+        "perplexity": 1.6019,
+        "epoch_time_sec": 31.3,
+        "batches": 25
+      },
+      "val": {
+        "loss": 0.330968,
+        "masked_token_accuracy": 1.0,
+        "perplexity": 1.3923,
+        "epoch_time_sec": 1.74,
+        "batches": 3
+      }
+    }
+  ],
+  "layer_memory_profile": {
+    "epoch_1": {
+      "bert.embeddings.word_embeddings": {
+        "avg_ram_delta_mb": 0.0523,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.embeddings.token_type_embeddings": {
+        "avg_ram_delta_mb": 0.0425,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.embeddings.position_embeddings": {
+        "avg_ram_delta_mb": 0.0052,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.embeddings.LayerNorm": {
+        "avg_ram_delta_mb": 0.063,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.embeddings.dropout": {
+        "avg_ram_delta_mb": 0.1028,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.embeddings": {
+        "avg_ram_delta_mb": 0.3787,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.attention.self.query": {
+        "avg_ram_delta_mb": 0.0861,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.attention.self.key": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.attention.self.value": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.attention.self": {
+        "avg_ram_delta_mb": 0.5469,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.attention.output.dense": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.attention.output.dropout": {
+        "avg_ram_delta_mb": 0.04,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.attention.output.LayerNorm": {
+        "avg_ram_delta_mb": 0.04,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.attention.output": {
+        "avg_ram_delta_mb": 0.08,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.attention": {
+        "avg_ram_delta_mb": 0.6272,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.intermediate.dense": {
+        "avg_ram_delta_mb": 0.2556,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.intermediate.intermediate_act_fn": {
+        "avg_ram_delta_mb": 0.2881,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.intermediate": {
+        "avg_ram_delta_mb": 0.5437,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.output.dense": {
+        "avg_ram_delta_mb": 0.0475,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.output.dropout": {
+        "avg_ram_delta_mb": 0.08,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.output.LayerNorm": {
+        "avg_ram_delta_mb": 0.04,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.output": {
+        "avg_ram_delta_mb": 0.2078,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0": {
+        "avg_ram_delta_mb": 1.3787,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.attention.self.query": {
+        "avg_ram_delta_mb": 0.04,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.attention.self.key": {
+        "avg_ram_delta_mb": 0.04,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.attention.self.value": {
+        "avg_ram_delta_mb": 0.04,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.attention.self": {
+        "avg_ram_delta_mb": 0.56,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.attention.output.dense": {
+        "avg_ram_delta_mb": 0.04,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.attention.output.dropout": {
+        "avg_ram_delta_mb": 0.08,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.attention.output.LayerNorm": {
+        "avg_ram_delta_mb": 0.04,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.attention.output": {
+        "avg_ram_delta_mb": 0.2,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.attention": {
+        "avg_ram_delta_mb": 0.76,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.intermediate.dense": {
+        "avg_ram_delta_mb": 0.2352,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.intermediate.intermediate_act_fn": {
+        "avg_ram_delta_mb": 0.3202,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.intermediate": {
+        "avg_ram_delta_mb": 0.5553,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.output.dense": {
+        "avg_ram_delta_mb": 0.04,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.output.dropout": {
+        "avg_ram_delta_mb": 0.08,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.output.LayerNorm": {
+        "avg_ram_delta_mb": 0.08,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.output": {
+        "avg_ram_delta_mb": 0.28,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1": {
+        "avg_ram_delta_mb": 1.5953,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.attention.self.query": {
+        "avg_ram_delta_mb": 0.04,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.attention.self.key": {
+        "avg_ram_delta_mb": 0.0802,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.attention.self.value": {
+        "avg_ram_delta_mb": 0.08,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.attention.self": {
+        "avg_ram_delta_mb": 1.0803,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.attention.output.dense": {
+        "avg_ram_delta_mb": 0.04,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.attention.output.dropout": {
+        "avg_ram_delta_mb": 0.16,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.attention.output.LayerNorm": {
+        "avg_ram_delta_mb": 0.08,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.attention.output": {
+        "avg_ram_delta_mb": 0.32,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.attention": {
+        "avg_ram_delta_mb": 1.4003,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.intermediate.dense": {
+        "avg_ram_delta_mb": 0.3202,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.intermediate.intermediate_act_fn": {
+        "avg_ram_delta_mb": 0.3202,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.intermediate": {
+        "avg_ram_delta_mb": 0.6403,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.output.dense": {
+        "avg_ram_delta_mb": 0.08,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.output.dropout": {
+        "avg_ram_delta_mb": 0.1602,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.output.LayerNorm": {
+        "avg_ram_delta_mb": 0.0802,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.output": {
+        "avg_ram_delta_mb": 0.4003,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2": {
+        "avg_ram_delta_mb": 2.4409,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.attention.self.query": {
+        "avg_ram_delta_mb": 0.08,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.attention.self.key": {
+        "avg_ram_delta_mb": 0.08,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.attention.self.value": {
+        "avg_ram_delta_mb": 0.08,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.attention.self": {
+        "avg_ram_delta_mb": 1.12,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.attention.output.dense": {
+        "avg_ram_delta_mb": 0.08,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.attention.output.dropout": {
+        "avg_ram_delta_mb": 0.16,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.attention.output.LayerNorm": {
+        "avg_ram_delta_mb": 0.08,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.attention.output": {
+        "avg_ram_delta_mb": 0.4,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.attention": {
+        "avg_ram_delta_mb": 1.52,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.intermediate.dense": {
+        "avg_ram_delta_mb": 0.6302,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.intermediate.intermediate_act_fn": {
+        "avg_ram_delta_mb": 0.7952,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.intermediate": {
+        "avg_ram_delta_mb": 1.4253,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.output.dense": {
+        "avg_ram_delta_mb": 0.12,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.output.dropout": {
+        "avg_ram_delta_mb": 0.48,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.output.LayerNorm": {
+        "avg_ram_delta_mb": 0.32,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.output": {
+        "avg_ram_delta_mb": 1.08,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3": {
+        "avg_ram_delta_mb": 4.0253,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder": {
+        "avg_ram_delta_mb": 9.4403,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert": {
+        "avg_ram_delta_mb": 9.9092,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "cls.predictions.transform.dense": {
+        "avg_ram_delta_mb": 0.36,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "cls.predictions.transform.transform_act_fn": {
+        "avg_ram_delta_mb": 0.3602,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "cls.predictions.transform.LayerNorm": {
+        "avg_ram_delta_mb": 0.44,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "cls.predictions.transform": {
+        "avg_ram_delta_mb": 1.1602,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "cls.predictions.decoder": {
+        "avg_ram_delta_mb": 60.0227,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "cls.predictions": {
+        "avg_ram_delta_mb": 61.1828,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "cls": {
+        "avg_ram_delta_mb": 61.1828,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      }
+    },
+    "epoch_2": {
+      "bert.embeddings.word_embeddings": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.embeddings.token_type_embeddings": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.embeddings.position_embeddings": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.embeddings.LayerNorm": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.embeddings.dropout": {
+        "avg_ram_delta_mb": 0.0025,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.embeddings": {
+        "avg_ram_delta_mb": 0.005,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.attention.self.query": {
+        "avg_ram_delta_mb": 0.0025,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.attention.self.key": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.attention.self.value": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.attention.self": {
+        "avg_ram_delta_mb": 0.005,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.attention.output.dense": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.attention.output.dropout": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.attention.output.LayerNorm": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.attention.output": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.attention": {
+        "avg_ram_delta_mb": 0.005,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.intermediate.dense": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.intermediate.intermediate_act_fn": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.intermediate": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.output.dense": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.output.dropout": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.output.LayerNorm": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0.output": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.0": {
+        "avg_ram_delta_mb": 0.005,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.attention.self.query": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.attention.self.key": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.attention.self.value": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.attention.self": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.attention.output.dense": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.attention.output.dropout": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.attention.output.LayerNorm": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.attention.output": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.attention": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.intermediate.dense": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.intermediate.intermediate_act_fn": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.intermediate": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.output.dense": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.output.dropout": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.output.LayerNorm": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1.output": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.1": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.attention.self.query": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.attention.self.key": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.attention.self.value": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.attention.self": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.attention.output.dense": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.attention.output.dropout": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.attention.output.LayerNorm": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.attention.output": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.attention": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.intermediate.dense": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.intermediate.intermediate_act_fn": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.intermediate": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.output.dense": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.output.dropout": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.output.LayerNorm": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2.output": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.2": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.attention.self.query": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.attention.self.key": {
+        "avg_ram_delta_mb": 0.0,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.attention.self.value": {
+        "avg_ram_delta_mb": 0.035,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.attention.self": {
+        "avg_ram_delta_mb": 0.51,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.attention.output.dense": {
+        "avg_ram_delta_mb": 0.04,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.attention.output.dropout": {
+        "avg_ram_delta_mb": 0.16,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.attention.output.LayerNorm": {
+        "avg_ram_delta_mb": 0.0802,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.attention.output": {
+        "avg_ram_delta_mb": 0.3202,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.attention": {
+        "avg_ram_delta_mb": 0.8302,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.intermediate.dense": {
+        "avg_ram_delta_mb": 0.59,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.intermediate.intermediate_act_fn": {
+        "avg_ram_delta_mb": 0.76,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.intermediate": {
+        "avg_ram_delta_mb": 1.35,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.output.dense": {
+        "avg_ram_delta_mb": 0.12,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.output.dropout": {
+        "avg_ram_delta_mb": 0.4,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.output.LayerNorm": {
+        "avg_ram_delta_mb": 0.315,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3.output": {
+        "avg_ram_delta_mb": 0.9952,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder.layer.3": {
+        "avg_ram_delta_mb": 3.1753,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert.encoder": {
+        "avg_ram_delta_mb": 3.1803,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "bert": {
+        "avg_ram_delta_mb": 3.1853,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "cls.predictions.transform.dense": {
+        "avg_ram_delta_mb": 0.32,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "cls.predictions.transform.transform_act_fn": {
+        "avg_ram_delta_mb": 0.4,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "cls.predictions.transform.LayerNorm": {
+        "avg_ram_delta_mb": 0.515,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "cls.predictions.transform": {
+        "avg_ram_delta_mb": 1.235,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "cls.predictions.decoder": {
+        "avg_ram_delta_mb": 59.6172,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "cls.predictions": {
+        "avg_ram_delta_mb": 60.8522,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      },
+      "cls": {
+        "avg_ram_delta_mb": 60.8522,
+        "avg_vram_delta_mb": 0.0,
+        "total_calls": 25
+      }
+    }
+  },
+  "finished_at": "2026-06-28T10:20:03.927099",
+  "best_val_loss": 0.330968
+}
