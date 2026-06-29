@@ -170,6 +170,7 @@ def swap_attention_layers(model: BertForMaskedLM, cls, config: BertConfig):
     n = 0
     for _, module in model.named_modules():
         if isinstance(module, BertAttention):
+            #create a new module that is defined by me 
             module.self = cls(config)
             n += 1
     print(f"[swap_attention] Replaced {n} layers → {cls.__name__}")
@@ -223,7 +224,14 @@ def run_epoch(model, loader, optimizer, scheduler, collator,
     with torch.set_grad_enabled(is_train):
         for batch in loader:
             keys  = list(batch.keys())
-            items = [{k: batch[k][i] for k in keys} for i in range(len(batch[keys[0]]))]
+            items = []
+            for i in range(len(batch[keys[0]])):
+                sample = {}
+
+                for k in keys:
+                    sample[k] = batch[k][i]
+
+                items.append(sample)
             masked = collator(items)
 
             input_ids = masked["input_ids"].to(device)
