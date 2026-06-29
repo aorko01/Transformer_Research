@@ -50,8 +50,8 @@ def load_wikipedia_dataset(
     print("Loading English Wikipedia...")
 
     dataset = load_dataset(
-    "wikipedia",
-    "20220301.en",
+    "wikimedia/wikipedia",   # official Parquet mirror — no loading script
+    "20231101.en",           # latest stable English dump
     split="train",
     trust_remote_code=True,   # required by newer datasets versions
     )
