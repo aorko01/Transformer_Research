@@ -94,7 +94,7 @@ class LayerProfileHook:
                 continue
             
             if list(module.children()):
-            continue
+                continue
 
             def _pre(mod, inp, _tag=name):
                 if torch.cuda.is_available():
