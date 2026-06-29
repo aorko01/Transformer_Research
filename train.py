@@ -131,7 +131,7 @@ class LayerProfileHook:
         self._handles.clear()
 
     def averages(self) -> Dict:
-    """Return per-layer averages over all calls seen since last reset()."""
+        """Return per-layer averages over all calls seen since last reset()."""
 
         result = {}
 

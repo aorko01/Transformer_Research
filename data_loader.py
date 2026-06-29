@@ -50,9 +50,10 @@ def load_wikipedia_dataset(
     print("Loading English Wikipedia...")
 
     dataset = load_dataset(
-        "wikipedia",
-        "20220301.en",
-        split="train",
+    "wikipedia",
+    "20220301.en",
+    split="train",
+    trust_remote_code=True,   # required by newer datasets versions
     )
 
     if len(dataset) < total:
