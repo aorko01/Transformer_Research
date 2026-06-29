@@ -92,6 +92,9 @@ class LayerProfileHook:
         for name, module in model.named_modules():
             if not name:
                 continue
+            
+            if list(module.children()):
+            continue
 
             def _pre(mod, inp, _tag=name):
                 if torch.cuda.is_available():
@@ -391,6 +394,8 @@ def train(args):
     # ── Profiling hook ───────────────────────────────────────────────
     hook = LayerProfileHook()
     hook.attach(model)
+    
+    last_checkpoint_time = time.time()
 
     # ── Epoch loop ───────────────────────────────────────────────────
     for epoch in range(start_epoch + 1, cfg["num_epochs"] + 1):
@@ -423,8 +428,6 @@ def train(args):
         })
 
         # Store per-epoch layer profile in metrics.json;
-        # also maintain a rolling average across all completed epochs.
-        run_meta.setdefault("layer_profile_per_epoch", {})[f"epoch_{epoch}"] = layer_profile
         _update_overall_layer_avg(run_meta, layer_profile, epoch)
 
         # ── Checkpoint (includes best_val_loss for safe resume) ──────
@@ -434,15 +437,21 @@ def train(args):
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "val_loss":             val_m["loss"],
-            "best_val_loss":        best_val_loss,   # carried forward
+            "best_val_loss":        best_val_loss,
             "bert_config":          BERT_SMALL_CONFIG,
             "training_cfg":         cfg,
             "custom_attention":     args.custom_attention or "none",
         }
-        ckpt_path = out_dir / f"checkpoint_epoch_{epoch}.pt"
-        torch.save(ckpt, ckpt_path)
-        print(f"\n  Checkpoint → {ckpt_path}")
 
+        # Only save the periodic checkpoint once per hour
+        current_time = time.time()
+        if current_time - last_checkpoint_time >= 3600:
+            ckpt_path = out_dir / f"checkpoint_epoch_{epoch}.pt"
+            torch.save(ckpt, ckpt_path)
+            print(f"\n  Checkpoint → {ckpt_path}")
+            last_checkpoint_time = current_time
+
+        # Best-model save is always safe now — ckpt is always defined above
         if val_m["loss"] < best_val_loss:
             best_val_loss = val_m["loss"]
             ckpt["best_val_loss"] = best_val_loss
