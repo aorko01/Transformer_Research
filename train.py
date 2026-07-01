@@ -9,7 +9,9 @@ Features
 * Per-layer peak VRAM + forward-pass time profiling (forward hooks)
 * Time-per-epoch, Cross-Entropy Loss, Masked Token Accuracy
 * All metrics → metrics.json  (epoch-averaged layer profiles only)
-* Checkpoint every epoch + best-model checkpoint
+* Checkpoint every CHECKPOINT_EVERY steps + best-model checkpoint
+* Only latest periodic checkpoint is kept on disk (+ best_model.pt)
+* Validation runs only at checkpoint intervals
 * Swappable attention:  --custom_attention path.to.MyClass
 * Resumes automatically if --resume_from_checkpoint <path> is given,
   or auto-detects the latest checkpoint in --output_dir
@@ -22,7 +24,6 @@ from typing import Optional, Dict, Tuple
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from tqdm import tqdm
@@ -62,14 +63,16 @@ TRAINING_DEFAULTS = dict(
     adam_beta2                  = 0.999,
     adam_epsilon                = 1e-6,
     max_grad_norm               = 1.0,
-    warmup_steps                = 1_000,      # ~1% of max_steps, scaled down from paper's 10k/1M
-    batch_size                  = 32,         # NEW: per-step micro-batch sized for 32GB VRAM + fp16
-    gradient_accumulation_steps = 8,          # NEW: 32 x 8 = effective batch 256
-    max_seq_length               = 512,
-    max_steps                   = 100_000,    # NEW: user's target run length, not the paper's 1M
+    warmup_steps                = 1_000,
+    batch_size                  = 32,
+    gradient_accumulation_steps = 8,          # 32 x 8 = effective batch 256
+    max_seq_length               = 1024,
+    max_steps                   = 100_000,
     max_train_samples           = None,       # None = stream full corpus
     max_val_samples              = 10_000,
 )
+
+CHECKPOINT_EVERY = 5_000   # NEW: validate + checkpoint every N optimizer steps
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -203,7 +206,7 @@ def load_checkpoint(path: Path, model, optimizer, scheduler, scaler, device):
     model.load_state_dict(ckpt["model_state_dict"])
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-    if "scaler_state_dict" in ckpt:                       # NEW: restore AMP scaler if present
+    if "scaler_state_dict" in ckpt:
         scaler.load_state_dict(ckpt["scaler_state_dict"])
     epoch_done  = ckpt["epoch"]
     step_done   = ckpt["global_step"]
@@ -221,29 +224,23 @@ def load_existing_metrics(metrics_path: Path) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Training / validation loop
+#  Validation loop  (training loop is now inlined in train())
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_epoch(model, loader, optimizer, scheduler, collator,
-              device, cfg, is_train: bool, scaler: Optional[GradScaler] = None,
+              device, cfg, is_train: bool, scaler=None,
               global_step: int = 0, max_steps: Optional[int] = None) -> Tuple[Dict, int]:
-    model.train(is_train)
+    """Used for validation only. is_train=True path is no longer called."""
+    model.eval()
     total_loss, total_correct, total_masked, n_batches = 0., 0, 0, 0
     t0 = time.perf_counter()
-    accum_steps = cfg["gradient_accumulation_steps"]
 
-    pbar = tqdm(loader, desc="train" if is_train else "val", leave=False)   # live progress bar
-    with torch.set_grad_enabled(is_train):
-        for i, batch in enumerate(pbar):
+    pbar = tqdm(loader, desc="val", leave=False)
+    with torch.no_grad():
+        for batch in pbar:
             keys  = list(batch.keys())
-            items = []
-            for j in range(len(batch[keys[0]])):
-                sample = {}
-
-                for k in keys:
-                    sample[k] = batch[k][j]
-
-                items.append(sample)
+            items = [{k: batch[k][j] for k in keys}
+                     for j in range(len(batch[keys[0]]))]
             masked = collator(items)
 
             input_ids = masked["input_ids"].to(device)
@@ -252,23 +249,12 @@ def run_epoch(model, loader, optimizer, scheduler, collator,
                 attn_mask = attn_mask.to(device)
             labels = masked["labels"].to(device)
 
-            with autocast():                                   # NEW: fp16 forward pass
+            with torch.amp.autocast('cuda'):    # fixed deprecation warning
                 outputs = model(input_ids=input_ids,
                                 attention_mask=attn_mask,
                                 labels=labels)
                 loss   = outputs.loss
                 logits = outputs.logits
-
-            if is_train:
-                scaler.scale(loss / accum_steps).backward()     # NEW: scaled backward for fp16
-                if (i + 1) % accum_steps == 0:
-                    scaler.unscale_(optimizer)                   # NEW: unscale before clipping
-                    nn.utils.clip_grad_norm_(model.parameters(), cfg["max_grad_norm"])
-                    scaler.step(optimizer)                       # NEW: scaler-aware optimizer step
-                    scaler.update()                              # NEW: adjust loss scale
-                    scheduler.step()
-                    optimizer.zero_grad()
-                    global_step += 1
 
             total_loss += loss.item()
             n_batches  += 1
@@ -278,16 +264,10 @@ def run_epoch(model, loader, optimizer, scheduler, collator,
                 total_correct += (logits.argmax(-1)[mask] == labels[mask]).sum().item()
                 total_masked  += mask.sum().item()
 
-            run_loss = total_loss / n_batches                    # live metrics in tqdm bar
+            run_loss = total_loss / n_batches
             run_acc  = total_correct / max(total_masked, 1)
-            run_ppl  = math.exp(min(run_loss, 20))
-            postfix  = dict(loss=f"{run_loss:.4f}", acc=f"{run_acc:.4f}", ppl=f"{run_ppl:.2f}")
-            if is_train:
-                postfix["step"] = f"{global_step}/{max_steps}"
-            pbar.set_postfix(postfix)
-
-            if is_train and max_steps is not None and global_step >= max_steps:
-                break
+            pbar.set_postfix(loss=f"{run_loss:.4f}", acc=f"{run_acc:.4f}",
+                             ppl=f"{math.exp(min(run_loss, 20)):.2f}")
 
     elapsed  = time.perf_counter() - t0
     avg_loss = total_loss / max(n_batches, 1)
@@ -355,7 +335,7 @@ def train(args):
         return_tensors="pt")
 
     train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"],
-                              num_workers=0, drop_last=True)   # shuffle handled in the stream itself
+                              num_workers=0, drop_last=True)
     val_loader   = DataLoader(val_ds,   batch_size=cfg["batch_size"] * 2,
                               num_workers=0)
 
@@ -377,9 +357,8 @@ def train(args):
 
     total_steps  = cfg["max_steps"]
     warmup_steps = cfg["warmup_steps"]
-    scheduler    = get_linear_schedule_with_warmup(
-        optimizer, warmup_steps, total_steps)
-    scaler       = GradScaler()                       # NEW: AMP loss scaler
+    scheduler    = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+    scaler       = torch.amp.GradScaler('cuda')    # fixed deprecation warning
 
     # ── Resume from checkpoint ───────────────────────────────────────
     start_epoch       = 0
@@ -401,6 +380,7 @@ def train(args):
     print(f"  Micro-batch size    : {cfg['batch_size']}")
     print(f"  Grad accum steps    : {cfg['gradient_accumulation_steps']}")
     print(f"  Effective batch     : {cfg['batch_size'] * cfg['gradient_accumulation_steps']}")
+    print(f"  Checkpoint every    : {CHECKPOINT_EVERY} steps")
     if start_global_step:
         print(f"  Resuming at step {start_global_step}/{total_steps}")
     print()
@@ -409,104 +389,168 @@ def train(args):
     run_meta = load_existing_metrics(metrics_path)
     if not run_meta:
         run_meta = {
-            "model":               "bert-small",
-            "params_M":            round(n_params, 2),
-            "device":              str(device),
-            "bert_config":         BERT_SMALL_CONFIG,
-            "training_cfg":        cfg,
-            "custom_attention":    args.custom_attention or "none",
-            "started_at":          datetime.now().isoformat(),
-            "epochs":              [],
-            # layer_memory_profile is populated incrementally below
+            "model":            "bert-base",
+            "params_M":         round(n_params, 2),
+            "device":           str(device),
+            "bert_config":      BERT_SMALL_CONFIG,
+            "training_cfg":     cfg,
+            "custom_attention": args.custom_attention or "none",
+            "started_at":       datetime.now().isoformat(),
+            "epochs":           [],       # train metrics per completed epoch
+            "checkpoints":      [],       # val metrics per CHECKPOINT_EVERY steps
         }
 
     # ── Profiling hook ───────────────────────────────────────────────
     hook = LayerProfileHook()
     hook.attach(model)
-    
-    last_checkpoint_time = time.time()
 
-    epoch       = start_epoch
-    global_step = start_global_step
+    # ── Step-driven training loop (persistent iterator) ───────────────
+    accum_steps    = cfg["gradient_accumulation_steps"]
+    epoch          = start_epoch          # last COMPLETED epoch
+    global_step    = start_global_step
+    micro_step     = 0                    # drives grad accumulation, never resets
+    last_ckpt_path = None                 # NEW: track for deletion
 
-    # ── Step-driven training loop ─────────────────────────────────────
+    # epoch-level train accumulators — flushed on dataset exhaustion
+    ep_loss, ep_correct, ep_masked, ep_batches = 0., 0, 0, 0
+    ep_t0 = time.perf_counter()
+
+    optimizer.zero_grad()
+    train_iter = iter(train_loader)
+    pbar = tqdm(total=cfg["max_steps"], initial=global_step, desc="train")
+
     while global_step < cfg["max_steps"]:
-        epoch += 1
-        print(f"\n{'─'*50}  Epoch {epoch}  (step {global_step}/{cfg['max_steps']})  {'─'*50}")
-        hook.reset()
 
-        train_m, global_step = run_epoch(model, train_loader, optimizer, scheduler,
-                            collator, device, cfg, is_train=True, scaler=scaler,
-                            global_step=global_step, max_steps=cfg["max_steps"])
+        # ── get next batch, cycling through the dataset ───────────────
+        try:
+            batch = next(train_iter)
+        except StopIteration:
+            # ── epoch boundary ────────────────────────────────────────
+            epoch += 1
+            if ep_batches > 0:
+                avg_loss = ep_loss / ep_batches
+                train_m  = {
+                    "loss":                  round(avg_loss, 6),
+                    "masked_token_accuracy": round(ep_correct / max(ep_masked, 1), 6),
+                    "perplexity":            round(math.exp(min(avg_loss, 20)), 4),
+                    "epoch_time_sec":        round(time.perf_counter() - ep_t0, 2),
+                    "batches":               ep_batches,
+                }
+                print(f"\n  [Epoch {epoch} @ step {global_step}]  "
+                      f"loss={train_m['loss']:.4f}  acc={train_m['masked_token_accuracy']:.4f}  "
+                      f"ppl={train_m['perplexity']:.2f}  time={train_m['epoch_time_sec']:.1f}s")
+                run_meta["epochs"].append({
+                    "epoch": epoch, "global_step": global_step, "train": train_m,
+                })
+                layer_profile = hook.averages()
+                hook.reset()
+                _update_overall_layer_avg(run_meta, layer_profile, epoch)
+                ep_loss, ep_correct, ep_masked, ep_batches = 0., 0, 0, 0
+                ep_t0 = time.perf_counter()
 
-        # Capture layer profile from the training pass only
-        layer_profile = hook.averages()
+            train_iter = iter(train_loader)
+            batch      = next(train_iter)
 
-        val_m, _ = run_epoch(model, val_loader, optimizer, scheduler,
-                          collator, device, cfg, is_train=False)
+        # ── forward pass ──────────────────────────────────────────────
+        model.train()
+        keys  = list(batch.keys())
+        items = [{k: batch[k][j] for k in keys}
+                 for j in range(len(batch[keys[0]]))]
+        masked_b  = collator(items)
+        input_ids = masked_b["input_ids"].to(device)
+        attn_mask = masked_b.get("attention_mask")
+        if attn_mask is not None:
+            attn_mask = attn_mask.to(device)
+        labels = masked_b["labels"].to(device)
 
-        print(f"\n  [Train]  loss={train_m['loss']:.4f}  "
-              f"acc={train_m['masked_token_accuracy']:.4f}  "
-              f"ppl={train_m['perplexity']:.2f}  "
-              f"time={train_m['epoch_time_sec']:.1f}s")
-        print(f"  [Val  ]  loss={val_m['loss']:.4f}  "
-              f"acc={val_m['masked_token_accuracy']:.4f}  "
-              f"ppl={val_m['perplexity']:.2f}  "
-              f"time={val_m['epoch_time_sec']:.1f}s")
+        with torch.amp.autocast('cuda'):    # fixed deprecation warning
+            outputs = model(input_ids=input_ids, attention_mask=attn_mask, labels=labels)
+            loss    = outputs.loss
+            logits  = outputs.logits
 
-        # ── Update metrics (epoch averages only; no per-epoch table) ─
-        run_meta.setdefault("epochs", []).append({
-            "epoch": epoch,
-            "global_step": global_step,
-            "train": train_m,
-            "val":   val_m,
-        })
+        scaler.scale(loss / accum_steps).backward()
 
-        # Store per-epoch layer profile in metrics.json;
-        _update_overall_layer_avg(run_meta, layer_profile, epoch)
+        ep_loss    += loss.item()
+        ep_batches += 1
+        mask_pos    = labels != -100
+        if mask_pos.any():
+            ep_correct += (logits.argmax(-1)[mask_pos] == labels[mask_pos]).sum().item()
+            ep_masked  += mask_pos.sum().item()
 
-        # ── Checkpoint (includes best_val_loss for safe resume) ──────
-        ckpt = {
-            "epoch":                epoch,
-            "global_step":          global_step,
-            "model_state_dict":     model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "scaler_state_dict":    scaler.state_dict(),     # NEW: persist AMP scaler state
-            "val_loss":             val_m["loss"],
-            "best_val_loss":        best_val_loss,
-            "bert_config":          BERT_SMALL_CONFIG,
-            "training_cfg":         cfg,
-            "custom_attention":     args.custom_attention or "none",
-        }
+        micro_step += 1
+        if micro_step % accum_steps == 0:
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), cfg["max_grad_norm"])
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            optimizer.zero_grad()
+            global_step += 1
 
-        # Only save the periodic checkpoint once per hour
-        current_time = time.time()
-        if current_time - last_checkpoint_time >= 3600:
-            ckpt_path = out_dir / f"checkpoint_step_{global_step}.pt"
-            torch.save(ckpt, ckpt_path)
-            print(f"\n  Checkpoint → {ckpt_path}")
-            last_checkpoint_time = current_time
+            run_loss = ep_loss / ep_batches
+            run_acc  = ep_correct / max(ep_masked, 1)
+            run_ppl  = math.exp(min(run_loss, 20))
+            pbar.set_postfix(
+                loss=f"{run_loss:.4f}", acc=f"{run_acc:.4f}",
+                ppl=f"{run_ppl:.2f}", epoch=epoch + 1,
+                step=f"{global_step}/{cfg['max_steps']}")
+            pbar.update(1)
 
-        # Best-model save is always safe now — ckpt is always defined above
-        if val_m["loss"] < best_val_loss:
-            best_val_loss = val_m["loss"]
-            ckpt["best_val_loss"] = best_val_loss
-            torch.save(
-                {k: ckpt[k] for k in (
-                    "epoch", "global_step", "model_state_dict", "bert_config",
-                    "training_cfg", "val_loss", "best_val_loss",
-                    "custom_attention")},
-                out_dir / "best_model.pt",
-            )
-            print(f"  ✓ Best val loss {best_val_loss:.4f} → best_model.pt")
+            # ── NEW: checkpoint + validate every CHECKPOINT_EVERY steps ──
+            if global_step % CHECKPOINT_EVERY == 0 or global_step >= cfg["max_steps"]:
+                val_m, _ = run_epoch(model, val_loader, optimizer, scheduler,
+                                     collator, device, cfg, is_train=False)
+                print(f"\n  [Step {global_step}]  "
+                      f"val_loss={val_m['loss']:.4f}  "
+                      f"val_acc={val_m['masked_token_accuracy']:.4f}  "
+                      f"val_ppl={val_m['perplexity']:.2f}")
 
-        # Flush metrics after every epoch so a crash loses nothing
-        run_meta["best_val_loss"] = best_val_loss
-        _save_metrics(run_meta, metrics_path)
+                ckpt = {
+                    "epoch":                epoch,
+                    "global_step":          global_step,
+                    "model_state_dict":     model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "scaler_state_dict":    scaler.state_dict(),
+                    "val_loss":             val_m["loss"],
+                    "best_val_loss":        best_val_loss,
+                    "bert_config":          BERT_SMALL_CONFIG,
+                    "training_cfg":         cfg,
+                    "custom_attention":     args.custom_attention or "none",
+                }
 
-        gc.collect()
+                # save new periodic checkpoint
+                new_ckpt_path = out_dir / f"checkpoint_step_{global_step}.pt"
+                torch.save(ckpt, new_ckpt_path)
+                print(f"  Checkpoint → {new_ckpt_path.name}")
 
+                # NEW: delete previous periodic checkpoint, keep only latest
+                if last_ckpt_path is not None and last_ckpt_path.exists():
+                    last_ckpt_path.unlink()
+                    print(f"  Deleted    → {last_ckpt_path.name}")
+                last_ckpt_path = new_ckpt_path
+
+                if val_m["loss"] < best_val_loss:
+                    best_val_loss         = val_m["loss"]
+                    ckpt["best_val_loss"] = best_val_loss
+                    torch.save(
+                        {k: ckpt[k] for k in (
+                            "epoch", "global_step", "model_state_dict", "bert_config",
+                            "training_cfg", "val_loss", "best_val_loss", "custom_attention")},
+                        out_dir / "best_model.pt",
+                    )
+                    print(f"  ✓ Best val loss {best_val_loss:.4f} → best_model.pt")
+
+                run_meta["checkpoints"].append({
+                    "global_step": global_step,
+                    "epoch":       epoch,
+                    "val":         val_m,
+                })
+                run_meta["best_val_loss"] = best_val_loss
+                _save_metrics(run_meta, metrics_path)
+                gc.collect()
+
+    pbar.close()
     hook.detach()
 
     # ── Final metrics flush ──────────────────────────────────────────
