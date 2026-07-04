@@ -9,7 +9,9 @@ Features
 * Per-layer peak VRAM + forward-pass time profiling (forward hooks)
 * Time-per-epoch, Cross-Entropy Loss, Masked Token Accuracy
 * All metrics → metrics.json  (epoch-averaged layer profiles only)
-* Checkpoint every epoch + best-model checkpoint
+* Checkpoint every CHECKPOINT_EVERY steps + best-model checkpoint
+* Only latest periodic checkpoint is kept on disk (+ best_model.pt)
+* Validation runs only at checkpoint intervals
 * Swappable attention:  --custom_attention path.to.MyClass
 * Resumes automatically if --resume_from_checkpoint <path> is given,
   or auto-detects the latest checkpoint in --output_dir
@@ -24,6 +26,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
+from tqdm import tqdm
 from transformers import (
     BertConfig, BertForMaskedLM, BertTokenizerFast,
     DataCollatorForLanguageModeling,
@@ -38,14 +41,14 @@ from data_loader import load_wikipedia_dataset
 # ─────────────────────────────────────────────────────────────────────────────
 
 BERT_SMALL_CONFIG = dict(
-    hidden_size                  = 512,
-    num_hidden_layers            = 4,
-    num_attention_heads          = 8,
-    intermediate_size            = 2048,
+    hidden_size                  = 768,
+    num_hidden_layers            = 12,
+    num_attention_heads          = 12,
+    intermediate_size            = 3072,
     hidden_act                   = "gelu",
     hidden_dropout_prob          = 0.1,
     attention_probs_dropout_prob = 0.1,
-    max_position_embeddings      = 512,
+    max_position_embeddings      = 1024,
     type_vocab_size              = 2,
     initializer_range            = 0.02,
     layer_norm_eps               = 1e-12,
@@ -53,20 +56,23 @@ BERT_SMALL_CONFIG = dict(
 )
 
 TRAINING_DEFAULTS = dict(
-    mlm_probability      = 0.15,
-    learning_rate        = 1e-4,
-    weight_decay         = 0.01,
-    adam_beta1           = 0.9,
-    adam_beta2           = 0.999,
-    adam_epsilon         = 1e-6,
-    max_grad_norm        = 1.0,
-    warmup_steps         = 10_000,
-    batch_size           = 32,
-    max_seq_length       = 128,
-    num_epochs           = 3,
-    max_train_samples    = 50_000,
-    max_val_samples      = 5_000,
+    mlm_probability             = 0.15,
+    learning_rate               = 1e-4,
+    weight_decay                = 0.01,
+    adam_beta1                  = 0.9,
+    adam_beta2                  = 0.999,
+    adam_epsilon                = 1e-6,
+    max_grad_norm               = 1.0,
+    warmup_steps                = 1_000,
+    batch_size                  = 32,
+    gradient_accumulation_steps = 8,          # 32 x 8 = effective batch 256
+    max_seq_length               = 1024,
+    max_steps                   = 100_000,
+    max_train_samples           = None,       # None = stream full corpus
+    max_val_samples              = 10_000,
 )
+
+CHECKPOINT_EVERY = 5_000   # NEW: validate + checkpoint every N optimizer steps
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -185,25 +191,28 @@ def swap_attention_layers(model: BertForMaskedLM, cls, config: BertConfig):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def find_latest_checkpoint(out_dir: Path) -> Optional[Path]:
-    """Return the checkpoint with the highest epoch number in out_dir, or None."""
-    ckpts = sorted(out_dir.glob("checkpoint_epoch_*.pt"))
+    """Return the checkpoint with the highest global_step in out_dir, or None."""
+    ckpts = sorted(out_dir.glob("checkpoint_step_*.pt"))
     return ckpts[-1] if ckpts else None
 
 
-def load_checkpoint(path: Path, model, optimizer, scheduler, device):
+def load_checkpoint(path: Path, model, optimizer, scheduler, scaler, device):
     """
     Load a checkpoint saved by this script.
-    Returns the epoch that was completed (so training resumes from epoch+1).
+    Returns (epoch_done, global_step_done, best_val_loss).
     """
     print(f"\n  Resuming from checkpoint: {path}")
     ckpt = torch.load(path, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-    epoch_done = ckpt["epoch"]
-    best_val   = ckpt.get("best_val_loss", float("inf"))
-    print(f"  Resumed after epoch {epoch_done}  (best val loss so far: {best_val:.4f})\n")
-    return epoch_done, best_val
+    if "scaler_state_dict" in ckpt:
+        scaler.load_state_dict(ckpt["scaler_state_dict"])
+    epoch_done  = ckpt["epoch"]
+    step_done   = ckpt["global_step"]
+    best_val    = ckpt.get("best_val_loss", float("inf"))
+    print(f"  Resumed after step {step_done}  (best val loss so far: {best_val:.4f})\n")
+    return epoch_done, step_done, best_val
 
 
 def load_existing_metrics(metrics_path: Path) -> dict:
@@ -215,26 +224,23 @@ def load_existing_metrics(metrics_path: Path) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Training / validation loop
+#  Validation loop  (training loop is now inlined in train())
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_epoch(model, loader, optimizer, scheduler, collator,
-              device, cfg, is_train: bool) -> Dict:
-    model.train(is_train)
+              device, cfg, is_train: bool, scaler=None,
+              global_step: int = 0, max_steps: Optional[int] = None) -> Tuple[Dict, int]:
+    """Used for validation only. is_train=True path is no longer called."""
+    model.eval()
     total_loss, total_correct, total_masked, n_batches = 0., 0, 0, 0
     t0 = time.perf_counter()
 
-    with torch.set_grad_enabled(is_train):
-        for batch in loader:
+    pbar = tqdm(loader, desc="val", leave=False)
+    with torch.no_grad():
+        for batch in pbar:
             keys  = list(batch.keys())
-            items = []
-            for i in range(len(batch[keys[0]])):
-                sample = {}
-
-                for k in keys:
-                    sample[k] = batch[k][i]
-
-                items.append(sample)
+            items = [{k: batch[k][j] for k in keys}
+                     for j in range(len(batch[keys[0]]))]
             masked = collator(items)
 
             input_ids = masked["input_ids"].to(device)
@@ -243,18 +249,12 @@ def run_epoch(model, loader, optimizer, scheduler, collator,
                 attn_mask = attn_mask.to(device)
             labels = masked["labels"].to(device)
 
-            outputs = model(input_ids=input_ids,
-                            attention_mask=attn_mask,
-                            labels=labels)
-            loss   = outputs.loss
-            logits = outputs.logits
-
-            if is_train:
-                loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), cfg["max_grad_norm"])
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
+            with torch.amp.autocast('cuda'):    # fixed deprecation warning
+                outputs = model(input_ids=input_ids,
+                                attention_mask=attn_mask,
+                                labels=labels)
+                loss   = outputs.loss
+                logits = outputs.logits
 
             total_loss += loss.item()
             n_batches  += 1
@@ -264,6 +264,11 @@ def run_epoch(model, loader, optimizer, scheduler, collator,
                 total_correct += (logits.argmax(-1)[mask] == labels[mask]).sum().item()
                 total_masked  += mask.sum().item()
 
+            run_loss = total_loss / n_batches
+            run_acc  = total_correct / max(total_masked, 1)
+            pbar.set_postfix(loss=f"{run_loss:.4f}", acc=f"{run_acc:.4f}",
+                             ppl=f"{math.exp(min(run_loss, 20)):.2f}")
+
     elapsed  = time.perf_counter() - t0
     avg_loss = total_loss / max(n_batches, 1)
     return {
@@ -272,7 +277,7 @@ def run_epoch(model, loader, optimizer, scheduler, collator,
         "perplexity":            round(math.exp(min(avg_loss, 20)), 4),
         "epoch_time_sec":        round(elapsed, 2),
         "batches":               n_batches,
-    }
+    }, global_step
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -293,12 +298,13 @@ def train(args):
 
     cfg = {
         **TRAINING_DEFAULTS,
-        "num_epochs":        args.epochs,
-        "batch_size":        args.batch_size,
-        "learning_rate":     args.lr,
-        "max_seq_length":    args.max_seq_length,
-        "max_train_samples": args.max_train_samples,
-        "max_val_samples":   args.max_val_samples,
+        "max_steps":                   args.max_steps,
+        "batch_size":                  args.batch_size,
+        "learning_rate":               args.lr,
+        "max_seq_length":              args.max_seq_length,
+        "max_train_samples":           args.max_train_samples,
+        "max_val_samples":             args.max_val_samples,
+        "gradient_accumulation_steps": args.grad_accum_steps,
     }
 
     # ── Tokenizer & model ────────────────────────────────────────────
@@ -318,7 +324,7 @@ def train(args):
 
     model.to(device)
 
-    # ── Data ─────────────────────────────────────────────────────────
+    # ── Data (streamed — see data_loader.py) ──────────────────────────
     train_ds, val_ds = load_wikipedia_dataset(
         tokenizer, cfg["max_seq_length"],
         cfg["max_train_samples"], cfg["max_val_samples"])
@@ -329,9 +335,9 @@ def train(args):
         return_tensors="pt")
 
     train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"],
-                              shuffle=True, num_workers=0, drop_last=True)
+                              num_workers=0, drop_last=True)
     val_loader   = DataLoader(val_ds,   batch_size=cfg["batch_size"] * 2,
-                              shuffle=False, num_workers=0)
+                              num_workers=0)
 
     # ── Optimizer & scheduler ────────────────────────────────────────
     no_decay  = {"bias", "LayerNorm.weight"}
@@ -349,14 +355,15 @@ def train(args):
         eps=cfg["adam_epsilon"],
     )
 
-    total_steps  = len(train_loader) * cfg["num_epochs"]
-    warmup_steps = min(cfg["warmup_steps"], total_steps // 10)
-    scheduler    = get_linear_schedule_with_warmup(
-        optimizer, warmup_steps, total_steps)
+    total_steps  = cfg["max_steps"]
+    warmup_steps = cfg["warmup_steps"]
+    scheduler    = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+    scaler       = torch.amp.GradScaler('cuda')    # fixed deprecation warning
 
     # ── Resume from checkpoint ───────────────────────────────────────
-    start_epoch   = 0          # epochs already completed
-    best_val_loss = float("inf")
+    start_epoch       = 0
+    start_global_step = 0
+    best_val_loss      = float("inf")
 
     resume_path = args.resume_from_checkpoint
     if resume_path is None and args.auto_resume:
@@ -365,111 +372,185 @@ def train(args):
             resume_path = str(latest)
 
     if resume_path:
-        start_epoch, best_val_loss = load_checkpoint(
-            Path(resume_path), model, optimizer, scheduler, device)
+        start_epoch, start_global_step, best_val_loss = load_checkpoint(
+            Path(resume_path), model, optimizer, scheduler, scaler, device)
 
-    print(f"  Train batches/epoch : {len(train_loader)}")
-    print(f"  Val   batches       : {len(val_loader)}")
     print(f"  Total steps         : {total_steps}")
     print(f"  Warmup steps        : {warmup_steps}")
-    if start_epoch:
-        print(f"  Skipping epochs 1–{start_epoch} (already done)")
+    print(f"  Micro-batch size    : {cfg['batch_size']}")
+    print(f"  Grad accum steps    : {cfg['gradient_accumulation_steps']}")
+    print(f"  Effective batch     : {cfg['batch_size'] * cfg['gradient_accumulation_steps']}")
+    print(f"  Checkpoint every    : {CHECKPOINT_EVERY} steps")
+    if start_global_step:
+        print(f"  Resuming at step {start_global_step}/{total_steps}")
     print()
 
     # ── Load or initialise the metrics document ──────────────────────
     run_meta = load_existing_metrics(metrics_path)
     if not run_meta:
         run_meta = {
-            "model":               "bert-small",
-            "params_M":            round(n_params, 2),
-            "device":              str(device),
-            "bert_config":         BERT_SMALL_CONFIG,
-            "training_cfg":        cfg,
-            "custom_attention":    args.custom_attention or "none",
-            "started_at":          datetime.now().isoformat(),
-            "epochs":              [],
-            # layer_memory_profile is populated incrementally below
+            "model":            "bert-base",
+            "params_M":         round(n_params, 2),
+            "device":           str(device),
+            "bert_config":      BERT_SMALL_CONFIG,
+            "training_cfg":     cfg,
+            "custom_attention": args.custom_attention or "none",
+            "started_at":       datetime.now().isoformat(),
+            "epochs":           [],       # train metrics per completed epoch
+            "checkpoints":      [],       # val metrics per CHECKPOINT_EVERY steps
         }
 
     # ── Profiling hook ───────────────────────────────────────────────
     hook = LayerProfileHook()
     hook.attach(model)
-    
-    last_checkpoint_time = time.time()
 
-    # ── Epoch loop ───────────────────────────────────────────────────
-    for epoch in range(start_epoch + 1, cfg["num_epochs"] + 1):
-        print(f"\n{'─'*50}  Epoch {epoch}/{cfg['num_epochs']}  {'─'*50}")
-        hook.reset()
+    # ── Step-driven training loop (persistent iterator) ───────────────
+    accum_steps    = cfg["gradient_accumulation_steps"]
+    epoch          = start_epoch          # last COMPLETED epoch
+    global_step    = start_global_step
+    micro_step     = 0                    # drives grad accumulation, never resets
+    last_ckpt_path = None                 # NEW: track for deletion
 
-        train_m = run_epoch(model, train_loader, optimizer, scheduler,
-                            collator, device, cfg, is_train=True)
+    # epoch-level train accumulators — flushed on dataset exhaustion
+    ep_loss, ep_correct, ep_masked, ep_batches = 0., 0, 0, 0
+    ep_t0 = time.perf_counter()
 
-        # Capture layer profile from the training pass only
-        layer_profile = hook.averages()
+    optimizer.zero_grad()
+    train_iter = iter(train_loader)
+    pbar = tqdm(total=cfg["max_steps"], initial=global_step, desc="train")
 
-        val_m = run_epoch(model, val_loader, optimizer, scheduler,
-                          collator, device, cfg, is_train=False)
+    while global_step < cfg["max_steps"]:
 
-        print(f"\n  [Train]  loss={train_m['loss']:.4f}  "
-              f"acc={train_m['masked_token_accuracy']:.4f}  "
-              f"ppl={train_m['perplexity']:.2f}  "
-              f"time={train_m['epoch_time_sec']:.1f}s")
-        print(f"  [Val  ]  loss={val_m['loss']:.4f}  "
-              f"acc={val_m['masked_token_accuracy']:.4f}  "
-              f"ppl={val_m['perplexity']:.2f}  "
-              f"time={val_m['epoch_time_sec']:.1f}s")
+        # ── get next batch, cycling through the dataset ───────────────
+        try:
+            batch = next(train_iter)
+        except StopIteration:
+            # ── epoch boundary ────────────────────────────────────────
+            epoch += 1
+            if ep_batches > 0:
+                avg_loss = ep_loss / ep_batches
+                train_m  = {
+                    "loss":                  round(avg_loss, 6),
+                    "masked_token_accuracy": round(ep_correct / max(ep_masked, 1), 6),
+                    "perplexity":            round(math.exp(min(avg_loss, 20)), 4),
+                    "epoch_time_sec":        round(time.perf_counter() - ep_t0, 2),
+                    "batches":               ep_batches,
+                }
+                print(f"\n  [Epoch {epoch} @ step {global_step}]  "
+                      f"loss={train_m['loss']:.4f}  acc={train_m['masked_token_accuracy']:.4f}  "
+                      f"ppl={train_m['perplexity']:.2f}  time={train_m['epoch_time_sec']:.1f}s")
+                run_meta["epochs"].append({
+                    "epoch": epoch, "global_step": global_step, "train": train_m,
+                })
+                layer_profile = hook.averages()
+                hook.reset()
+                _update_overall_layer_avg(run_meta, layer_profile, epoch)
+                ep_loss, ep_correct, ep_masked, ep_batches = 0., 0, 0, 0
+                ep_t0 = time.perf_counter()
 
-        # ── Update metrics (epoch averages only; no per-epoch table) ─
-        run_meta.setdefault("epochs", []).append({
-            "epoch": epoch,
-            "train": train_m,
-            "val":   val_m,
-        })
+            train_iter = iter(train_loader)
+            batch      = next(train_iter)
 
-        # Store per-epoch layer profile in metrics.json;
-        _update_overall_layer_avg(run_meta, layer_profile, epoch)
+        # ── forward pass ──────────────────────────────────────────────
+        model.train()
+        keys  = list(batch.keys())
+        items = [{k: batch[k][j] for k in keys}
+                 for j in range(len(batch[keys[0]]))]
+        masked_b  = collator(items)
+        input_ids = masked_b["input_ids"].to(device)
+        attn_mask = masked_b.get("attention_mask")
+        if attn_mask is not None:
+            attn_mask = attn_mask.to(device)
+        labels = masked_b["labels"].to(device)
 
-        # ── Checkpoint (includes best_val_loss for safe resume) ──────
-        ckpt = {
-            "epoch":                epoch,
-            "model_state_dict":     model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "val_loss":             val_m["loss"],
-            "best_val_loss":        best_val_loss,
-            "bert_config":          BERT_SMALL_CONFIG,
-            "training_cfg":         cfg,
-            "custom_attention":     args.custom_attention or "none",
-        }
+        with torch.amp.autocast('cuda'):    # fixed deprecation warning
+            outputs = model(input_ids=input_ids, attention_mask=attn_mask, labels=labels)
+            loss    = outputs.loss
+            logits  = outputs.logits
 
-        # Only save the periodic checkpoint once per hour
-        current_time = time.time()
-        if current_time - last_checkpoint_time >= 3600:
-            ckpt_path = out_dir / f"checkpoint_epoch_{epoch}.pt"
-            torch.save(ckpt, ckpt_path)
-            print(f"\n  Checkpoint → {ckpt_path}")
-            last_checkpoint_time = current_time
+        scaler.scale(loss / accum_steps).backward()
 
-        # Best-model save is always safe now — ckpt is always defined above
-        if val_m["loss"] < best_val_loss:
-            best_val_loss = val_m["loss"]
-            ckpt["best_val_loss"] = best_val_loss
-            torch.save(
-                {k: ckpt[k] for k in (
-                    "epoch", "model_state_dict", "bert_config",
-                    "training_cfg", "val_loss", "best_val_loss",
-                    "custom_attention")},
-                out_dir / "best_model.pt",
-            )
-            print(f"  ✓ Best val loss {best_val_loss:.4f} → best_model.pt")
+        ep_loss    += loss.item()
+        ep_batches += 1
+        mask_pos    = labels != -100
+        if mask_pos.any():
+            ep_correct += (logits.argmax(-1)[mask_pos] == labels[mask_pos]).sum().item()
+            ep_masked  += mask_pos.sum().item()
 
-        # Flush metrics after every epoch so a crash loses nothing
-        run_meta["best_val_loss"] = best_val_loss
-        _save_metrics(run_meta, metrics_path)
+        micro_step += 1
+        if micro_step % accum_steps == 0:
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), cfg["max_grad_norm"])
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            optimizer.zero_grad()
+            global_step += 1
 
-        gc.collect()
+            run_loss = ep_loss / ep_batches
+            run_acc  = ep_correct / max(ep_masked, 1)
+            run_ppl  = math.exp(min(run_loss, 20))
+            pbar.set_postfix(
+                loss=f"{run_loss:.4f}", acc=f"{run_acc:.4f}",
+                ppl=f"{run_ppl:.2f}", epoch=epoch + 1,
+                step=f"{global_step}/{cfg['max_steps']}")
+            pbar.update(1)
 
+            # ── NEW: checkpoint + validate every CHECKPOINT_EVERY steps ──
+            if global_step % CHECKPOINT_EVERY == 0 or global_step >= cfg["max_steps"]:
+                val_m, _ = run_epoch(model, val_loader, optimizer, scheduler,
+                                     collator, device, cfg, is_train=False)
+                print(f"\n  [Step {global_step}]  "
+                      f"val_loss={val_m['loss']:.4f}  "
+                      f"val_acc={val_m['masked_token_accuracy']:.4f}  "
+                      f"val_ppl={val_m['perplexity']:.2f}")
+
+                ckpt = {
+                    "epoch":                epoch,
+                    "global_step":          global_step,
+                    "model_state_dict":     model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "scaler_state_dict":    scaler.state_dict(),
+                    "val_loss":             val_m["loss"],
+                    "best_val_loss":        best_val_loss,
+                    "bert_config":          BERT_SMALL_CONFIG,
+                    "training_cfg":         cfg,
+                    "custom_attention":     args.custom_attention or "none",
+                }
+
+                # save new periodic checkpoint
+                new_ckpt_path = out_dir / f"checkpoint_step_{global_step}.pt"
+                torch.save(ckpt, new_ckpt_path)
+                print(f"  Checkpoint → {new_ckpt_path.name}")
+
+                # NEW: delete previous periodic checkpoint, keep only latest
+                if last_ckpt_path is not None and last_ckpt_path.exists():
+                    last_ckpt_path.unlink()
+                    print(f"  Deleted    → {last_ckpt_path.name}")
+                last_ckpt_path = new_ckpt_path
+
+                if val_m["loss"] < best_val_loss:
+                    best_val_loss         = val_m["loss"]
+                    ckpt["best_val_loss"] = best_val_loss
+                    torch.save(
+                        {k: ckpt[k] for k in (
+                            "epoch", "global_step", "model_state_dict", "bert_config",
+                            "training_cfg", "val_loss", "best_val_loss", "custom_attention")},
+                        out_dir / "best_model.pt",
+                    )
+                    print(f"  ✓ Best val loss {best_val_loss:.4f} → best_model.pt")
+
+                run_meta["checkpoints"].append({
+                    "global_step": global_step,
+                    "epoch":       epoch,
+                    "val":         val_m,
+                })
+                run_meta["best_val_loss"] = best_val_loss
+                _save_metrics(run_meta, metrics_path)
+                gc.collect()
+
+    pbar.close()
     hook.detach()
 
     # ── Final metrics flush ──────────────────────────────────────────
@@ -523,12 +604,13 @@ def _save_metrics(run_meta: dict, path: Path):
 def parse_args():
     p = argparse.ArgumentParser(description="BERT-Small MLM training")
     p.add_argument("--output_dir",           default="./bert_small_output")
-    p.add_argument("--epochs",     type=int, default=TRAINING_DEFAULTS["num_epochs"])
+    p.add_argument("--max_steps",  type=int, default=TRAINING_DEFAULTS["max_steps"])
     p.add_argument("--batch_size", type=int, default=TRAINING_DEFAULTS["batch_size"])
     p.add_argument("--lr",         type=float, default=TRAINING_DEFAULTS["learning_rate"])
     p.add_argument("--max_seq_length",    type=int, default=TRAINING_DEFAULTS["max_seq_length"])
     p.add_argument("--max_train_samples", type=int, default=TRAINING_DEFAULTS["max_train_samples"])
     p.add_argument("--max_val_samples",   type=int, default=TRAINING_DEFAULTS["max_val_samples"])
+    p.add_argument("--grad_accum_steps",  type=int, default=TRAINING_DEFAULTS["gradient_accumulation_steps"])
     p.add_argument("--custom_attention",  type=str, default=None,
                    help="Module.ClassName of custom attention, "
                         "e.g. custom_attention_template.LinearAttention")
@@ -536,7 +618,7 @@ def parse_args():
     # ── Resume options ───────────────────────────────────────────────
     resume = p.add_mutually_exclusive_group()
     resume.add_argument("--resume_from_checkpoint", type=str, default=None,
-                        help="Path to a specific checkpoint_epoch_N.pt to resume from.")
+                        help="Path to a specific checkpoint_step_N.pt to resume from.")
     resume.add_argument("--auto_resume", action="store_true",
                         help="Automatically resume from the latest checkpoint in --output_dir.")
 

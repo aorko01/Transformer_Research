@@ -1,35 +1,36 @@
 """
 data_loader.py
 ==============
-Loads the English Wikipedia dataset for BERT pretraining using the
-Hugging Face datasets library.
-
-The datasets library automatically caches downloaded datasets, so no
-manual cache handling is required.
+Streams the English Wikipedia dataset for BERT pretraining using the
+Hugging Face datasets library — no full corpus is materialized in RAM.
 """
-
 from typing import Optional
-
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import IterableDataset
 from datasets import load_dataset
 
 
-class TokenDataset(Dataset):
-    def __init__(self, encoding):
-        self.enc = encoding
+class StreamingTokenDataset(IterableDataset):     # NEW: replaces eager TokenDataset
+    """Tokenizes articles on the fly as they're pulled from the HF stream."""
+    def __init__(self, hf_stream, tokenizer, max_seq_length):
+        self.hf_stream = hf_stream
+        self.tokenizer = tokenizer
+        self.max_seq_length = max_seq_length
 
-    def __len__(self):
-        return len(self.enc["input_ids"])
-
-    #returns the input id , attention mask and special attention mask for every input id/sentence
-    def __getitem__(self, idx):
-        sample = {}
-
-        for k, v in self.enc.items():
-            sample[k] = torch.tensor(v[idx])
-
-        return sample
+    def __iter__(self):
+        for example in self.hf_stream:
+            text = example.get("text")
+            if not text:
+                continue
+            enc = self.tokenizer(
+                text,
+                truncation=True,
+                max_length=self.max_seq_length,
+                padding="max_length",
+                return_special_tokens_mask=True,
+                return_tensors=None,
+            )
+            yield {k: torch.tensor(v) for k, v in enc.items()}
 
 
 def load_wikipedia_dataset(
@@ -40,52 +41,26 @@ def load_wikipedia_dataset(
 ):
     """
     Returns:
-        train_dataset, val_dataset
+        train_dataset, val_dataset   (both streaming IterableDatasets)
     """
-
-    max_train = max_train or 50_000
-    max_val = max_val or 5_000
-    total = max_train + max_val
-
-    print("Loading English Wikipedia...")
-
+    max_val = max_val or 10_000
+    print("Streaming English Wikipedia (no full download)...")
     dataset = load_dataset(
-    "wikimedia/wikipedia",   # official Parquet mirror — no loading script
-    "20231101.en",           # latest stable English dump
-    split="train",
-    trust_remote_code=True,   # required by newer datasets versions
+        "wikimedia/wikipedia",   # official Parquet mirror — no loading script
+        "20231101.en",           # latest stable English dump
+        split="train",
+        streaming=True,           # NEW: stream instead of eager-loading the full split
+        trust_remote_code=True,
     )
 
-    if len(dataset) < total:
-        raise RuntimeError(
-            f"Dataset contains only {len(dataset)} articles; "
-            f"requested {total}."
-        )
+    val_stream   = dataset.take(max_val)            # NEW: first N articles → val
+    train_stream = dataset.skip(max_val)            # NEW: remainder → train
+    if max_train is not None:
+        train_stream = train_stream.take(max_train)  # NEW: optional cap, else full corpus
+    train_stream = train_stream.shuffle(buffer_size=10_000, seed=42)  # NEW: streaming shuffle buffer
 
-    texts = dataset["text"][:total]
+    train_ds = StreamingTokenDataset(train_stream, tokenizer, max_seq_length)
+    val_ds   = StreamingTokenDataset(val_stream, tokenizer, max_seq_length)
 
-    train_texts = texts[:max_train]
-    val_texts = texts[max_train:]
-
-    def encode(texts):
-        return tokenizer(
-            texts,
-            truncation=True,
-            max_length=max_seq_length,
-            padding="max_length",
-            return_special_tokens_mask=True,
-            return_tensors=None,
-        )
-
-    print(f"Tokenizing {len(train_texts)} training articles...")
-    train_encoding = encode(train_texts)
-
-    print(f"Tokenizing {len(val_texts)} validation articles...")
-    val_encoding = encode(val_texts)
-
-    print("Done.")
-
-    return (
-        TokenDataset(train_encoding),
-        TokenDataset(val_encoding),
-    )
+    print("Streaming dataset ready (tokenization happens per-batch during training).")
+    return train_ds, val_ds
