@@ -43,7 +43,7 @@ from data_loader import load_wikipedia_dataset
 BERT_SMALL_CONFIG = dict(
     hidden_size                  = 768,
     num_hidden_layers            = 12,
-    num_attention_heads          = 12,
+    num_attention_heads          = 1,
     intermediate_size            = 3072,
     hidden_act                   = "gelu",
     hidden_dropout_prob          = 0.1,
@@ -73,6 +73,13 @@ TRAINING_DEFAULTS = dict(
 )
 
 CHECKPOINT_EVERY = 5_000   # NEW: validate + checkpoint every N optimizer steps
+
+# Layer profiling window: warm up so caches/cuDNN autotune/the CUDA allocator
+# stabilize, then measure a handful of iterations and average — iterations
+# are ~identical after warmup, and the hooks force CUDA syncs, so we only
+# pay that cost for a short window instead of for the whole run.
+PROFILE_WARMUP_ITERS = 30
+PROFILE_ITERS        = 5
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -243,11 +250,11 @@ def run_epoch(model, loader, optimizer, scheduler, collator,
                      for j in range(len(batch[keys[0]]))]
             masked = collator(items)
 
-            input_ids = masked["input_ids"].to(device)
+            input_ids = masked["input_ids"].to(device, non_blocking=True)
             attn_mask = masked.get("attention_mask")
             if attn_mask is not None:
-                attn_mask = attn_mask.to(device)
-            labels = masked["labels"].to(device)
+                attn_mask = attn_mask.to(device, non_blocking=True)
+            labels = masked["labels"].to(device, non_blocking=True)
 
             with torch.amp.autocast('cuda'):    # fixed deprecation warning
                 outputs = model(input_ids=input_ids,
@@ -324,20 +331,29 @@ def train(args):
 
     model.to(device)
 
-    # ── Data (streamed — see data_loader.py) ──────────────────────────
+    # ── Data (downloaded to disk, then read from disk — see data_loader.py) ──
     train_ds, val_ds = load_wikipedia_dataset(
         tokenizer, cfg["max_seq_length"],
-        cfg["max_train_samples"], cfg["max_val_samples"])
+        cfg["max_train_samples"], cfg["max_val_samples"],
+        data_dir=args.data_dir)
 
     collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer, mlm=True,
         mlm_probability=cfg["mlm_probability"],
         return_tensors="pt")
 
+    # Tokenization is CPU-bound; run it in worker processes (pinned + prefetched)
+    # so it overlaps with the GPU instead of blocking the main process each step.
+    loader_kwargs = dict(
+        num_workers=args.num_workers,
+        pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=4 if args.num_workers > 0 else None,
+    )
     train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"],
-                              num_workers=0, drop_last=True)
+                              drop_last=True, **loader_kwargs)
     val_loader   = DataLoader(val_ds,   batch_size=cfg["batch_size"] * 2,
-                              num_workers=0)
+                              **loader_kwargs)
 
     # ── Optimizer & scheduler ────────────────────────────────────────
     no_decay  = {"bias", "LayerNorm.weight"}
@@ -400,9 +416,10 @@ def train(args):
             "checkpoints":      [],       # val metrics per CHECKPOINT_EVERY steps
         }
 
-    # ── Profiling hook ───────────────────────────────────────────────
-    hook = LayerProfileHook()
-    hook.attach(model)
+    # ── Profiling hook (measured once: warmup, then a short profile window) ──
+    hook      = LayerProfileHook()
+    profiled  = False
+    fwd_count = 0
 
     # ── Step-driven training loop (persistent iterator) ───────────────
     accum_steps    = cfg["gradient_accumulation_steps"]
@@ -412,7 +429,11 @@ def train(args):
     last_ckpt_path = None                 # NEW: track for deletion
 
     # epoch-level train accumulators — flushed on dataset exhaustion
-    ep_loss, ep_correct, ep_masked, ep_batches = 0., 0, 0, 0
+    # kept on-device so the hot loop never forces a CUDA sync via .item()/.any()
+    ep_loss    = torch.zeros((), device=device)
+    ep_correct = torch.zeros((), device=device, dtype=torch.long)
+    ep_masked  = torch.zeros((), device=device, dtype=torch.long)
+    ep_batches = 0
     ep_t0 = time.perf_counter()
 
     optimizer.zero_grad()
@@ -428,10 +449,11 @@ def train(args):
             # ── epoch boundary ────────────────────────────────────────
             epoch += 1
             if ep_batches > 0:
-                avg_loss = ep_loss / ep_batches
+                avg_loss = (ep_loss / ep_batches).item()
+                acc      = ep_correct.item() / max(ep_masked.item(), 1)
                 train_m  = {
                     "loss":                  round(avg_loss, 6),
-                    "masked_token_accuracy": round(ep_correct / max(ep_masked, 1), 6),
+                    "masked_token_accuracy": round(acc, 6),
                     "perplexity":            round(math.exp(min(avg_loss, 20)), 4),
                     "epoch_time_sec":        round(time.perf_counter() - ep_t0, 2),
                     "batches":               ep_batches,
@@ -442,10 +464,8 @@ def train(args):
                 run_meta["epochs"].append({
                     "epoch": epoch, "global_step": global_step, "train": train_m,
                 })
-                layer_profile = hook.averages()
-                hook.reset()
-                _update_overall_layer_avg(run_meta, layer_profile, epoch)
-                ep_loss, ep_correct, ep_masked, ep_batches = 0., 0, 0, 0
+                ep_loss.zero_(); ep_correct.zero_(); ep_masked.zero_()
+                ep_batches = 0
                 ep_t0 = time.perf_counter()
 
             train_iter = iter(train_loader)
@@ -453,15 +473,33 @@ def train(args):
 
         # ── forward pass ──────────────────────────────────────────────
         model.train()
+
+        # ── one-time layer profiling: warm up, then measure a short window ──
+        fwd_count += 1
+        if not profiled:
+            if fwd_count == PROFILE_WARMUP_ITERS + 1:
+                hook.attach(model)
+            elif fwd_count == PROFILE_WARMUP_ITERS + PROFILE_ITERS + 1:
+                hook.detach()
+                run_meta["layer_profile"] = {
+                    "warmup_iters":   PROFILE_WARMUP_ITERS,
+                    "profiled_iters": PROFILE_ITERS,
+                    "layers":         hook.averages(),
+                }
+                _save_metrics(run_meta, metrics_path)
+                print(f"\n  [Profile] layer VRAM/time averaged over {PROFILE_ITERS} iters "
+                      f"(after {PROFILE_WARMUP_ITERS} warmup iters) → metrics.json\n")
+                profiled = True
+
         keys  = list(batch.keys())
         items = [{k: batch[k][j] for k in keys}
                  for j in range(len(batch[keys[0]]))]
         masked_b  = collator(items)
-        input_ids = masked_b["input_ids"].to(device)
+        input_ids = masked_b["input_ids"].to(device, non_blocking=True)
         attn_mask = masked_b.get("attention_mask")
         if attn_mask is not None:
-            attn_mask = attn_mask.to(device)
-        labels = masked_b["labels"].to(device)
+            attn_mask = attn_mask.to(device, non_blocking=True)
+        labels = masked_b["labels"].to(device, non_blocking=True)
 
         with torch.amp.autocast('cuda'):    # fixed deprecation warning
             outputs = model(input_ids=input_ids, attention_mask=attn_mask, labels=labels)
@@ -470,12 +508,13 @@ def train(args):
 
         scaler.scale(loss / accum_steps).backward()
 
-        ep_loss    += loss.item()
+        # accumulate on-device — no .item()/.any() here, else every micro-step
+        # forces a CUDA sync and stalls the async kernel-launch pipeline
+        ep_loss    += loss.detach()
         ep_batches += 1
         mask_pos    = labels != -100
-        if mask_pos.any():
-            ep_correct += (logits.argmax(-1)[mask_pos] == labels[mask_pos]).sum().item()
-            ep_masked  += mask_pos.sum().item()
+        ep_correct += (logits.argmax(-1)[mask_pos] == labels[mask_pos]).sum()
+        ep_masked  += mask_pos.sum()
 
         micro_step += 1
         if micro_step % accum_steps == 0:
@@ -487,8 +526,8 @@ def train(args):
             optimizer.zero_grad()
             global_step += 1
 
-            run_loss = ep_loss / ep_batches
-            run_acc  = ep_correct / max(ep_masked, 1)
+            run_loss = (ep_loss / ep_batches).item()
+            run_acc  = ep_correct.item() / max(ep_masked.item(), 1)
             run_ppl  = math.exp(min(run_loss, 20))
             pbar.set_postfix(
                 loss=f"{run_loss:.4f}", acc=f"{run_acc:.4f}",
@@ -568,30 +607,6 @@ def train(args):
 #  Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _update_overall_layer_avg(run_meta: dict, layer_profile: dict, epoch: int):
-    """
-    Maintain a cumulative average of peak_vram and forward_ms across epochs
-    and store it under run_meta["layer_profile_overall_avg"].
-    Uses an incremental mean formula so we never store raw sums in the JSON.
-    """
-    overall = run_meta.setdefault("layer_profile_overall_avg", {})
-    n = epoch   # number of epochs averaged so far (1-indexed, all included)
-
-    for name, stats in layer_profile.items():
-        if name not in overall:
-            overall[name] = {
-                "avg_peak_vram_mb": stats["avg_peak_vram_mb"],
-                "avg_forward_ms":   stats["avg_forward_ms"],
-            }
-        else:
-            prev = overall[name]
-            # Welford-style incremental mean
-            prev["avg_peak_vram_mb"] = round(
-                prev["avg_peak_vram_mb"] + (stats["avg_peak_vram_mb"] - prev["avg_peak_vram_mb"]) / n, 4)
-            prev["avg_forward_ms"]   = round(
-                prev["avg_forward_ms"]   + (stats["avg_forward_ms"]   - prev["avg_forward_ms"])   / n, 4)
-
-
 def _save_metrics(run_meta: dict, path: Path):
     with open(path, "w") as f:
         json.dump(run_meta, f, indent=2)
@@ -604,6 +619,12 @@ def _save_metrics(run_meta: dict, path: Path):
 def parse_args():
     p = argparse.ArgumentParser(description="BERT-Small MLM training")
     p.add_argument("--output_dir",           default="./bert_small_output")
+    p.add_argument("--num_workers", type=int, default=4,
+                   help="DataLoader worker processes for tokenization; 0 tokenizes "
+                        "on the main process (GPU idles between batches).")
+    p.add_argument("--data_dir",             default=None,
+                   help="Directory to download/cache the full Wikipedia dataset on disk "
+                        "(default: Hugging Face's default cache dir).")
     p.add_argument("--max_steps",  type=int, default=TRAINING_DEFAULTS["max_steps"])
     p.add_argument("--batch_size", type=int, default=TRAINING_DEFAULTS["batch_size"])
     p.add_argument("--lr",         type=float, default=TRAINING_DEFAULTS["learning_rate"])
