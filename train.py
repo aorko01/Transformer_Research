@@ -1,8 +1,9 @@
 """
-train.py  –  BERT-Small MLM on English Wikipedia
-=================================================
-Paper-accurate BERT-Small (Turc et al., 2019 / Well-Read Students…):
-  hidden_size=512, num_hidden_layers=4, num_attention_heads=8, intermediate_size=2048
+train.py  –  BERT-Base MLM on English Wikipedia (single-head attention)
+=========================================================================
+BERT-Base dimensions (Devlin et al., 2019) with attention heads forced to 1
+(vanilla single-head self-attention instead of the paper's 12 heads):
+  hidden_size=768, num_hidden_layers=12, num_attention_heads=1, intermediate_size=3072
 
 Features
 --------
@@ -43,7 +44,7 @@ from data_loader import load_wikipedia_dataset
 BERT_SMALL_CONFIG = dict(
     hidden_size                  = 768,
     num_hidden_layers            = 12,
-    num_attention_heads          = 1,
+    num_attention_heads          = 1,     # single-head vanilla attention (bert-base uses 12)
     intermediate_size            = 3072,
     hidden_act                   = "gelu",
     hidden_dropout_prob          = 0.1,
@@ -199,8 +200,10 @@ def swap_attention_layers(model: BertForMaskedLM, cls, config: BertConfig):
 
 def find_latest_checkpoint(out_dir: Path) -> Optional[Path]:
     """Return the checkpoint with the highest global_step in out_dir, or None."""
-    ckpts = sorted(out_dir.glob("checkpoint_step_*.pt"))
-    return ckpts[-1] if ckpts else None
+    ckpts = list(out_dir.glob("checkpoint_step_*.pt"))
+    if not ckpts:
+        return None
+    return max(ckpts, key=lambda p: int(p.stem.rsplit("_", 1)[1]))
 
 
 def load_checkpoint(path: Path, model, optimizer, scheduler, scaler, device):
@@ -239,6 +242,7 @@ def run_epoch(model, loader, optimizer, scheduler, collator,
               global_step: int = 0, max_steps: Optional[int] = None) -> Tuple[Dict, int]:
     """Used for validation only. is_train=True path is no longer called."""
     model.eval()
+    device_type = device.type
     total_loss, total_correct, total_masked, n_batches = 0., 0, 0, 0
     t0 = time.perf_counter()
 
@@ -256,7 +260,7 @@ def run_epoch(model, loader, optimizer, scheduler, collator,
                 attn_mask = attn_mask.to(device, non_blocking=True)
             labels = masked["labels"].to(device, non_blocking=True)
 
-            with torch.amp.autocast('cuda'):    # fixed deprecation warning
+            with torch.amp.autocast(device_type, enabled=(device_type == "cuda")):
                 outputs = model(input_ids=input_ids,
                                 attention_mask=attn_mask,
                                 labels=labels)
@@ -292,7 +296,8 @@ def run_epoch(model, loader, optimizer, scheduler, collator,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def train(args):
-    device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device_type = device.type
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = out_dir / "metrics.json"
@@ -319,15 +324,15 @@ def train(args):
     bert_cfg  = BertConfig(**BERT_SMALL_CONFIG)
     model     = BertForMaskedLM(bert_cfg)
 
-    n_params = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"  Model params : {n_params:.1f}M")
-
     if args.custom_attention:
         mod_str, cls_name = args.custom_attention.rsplit(".", 1)
         sys.path.insert(0, str(Path(mod_str).parent) if "/" in mod_str else ".")
         import importlib
         mod   = importlib.import_module(mod_str.split("/")[-1].replace(".py", ""))
         model = swap_attention_layers(model, getattr(mod, cls_name), bert_cfg)
+
+    n_params = sum(p.numel() for p in model.parameters()) / 1e6
+    print(f"  Model params : {n_params:.1f}M")
 
     model.to(device)
 
@@ -374,7 +379,7 @@ def train(args):
     total_steps  = cfg["max_steps"]
     warmup_steps = cfg["warmup_steps"]
     scheduler    = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-    scaler       = torch.amp.GradScaler('cuda')    # fixed deprecation warning
+    scaler       = torch.amp.GradScaler(device_type, enabled=(device_type == "cuda"))
 
     # ── Resume from checkpoint ───────────────────────────────────────
     start_epoch       = 0
@@ -501,7 +506,7 @@ def train(args):
             attn_mask = attn_mask.to(device, non_blocking=True)
         labels = masked_b["labels"].to(device, non_blocking=True)
 
-        with torch.amp.autocast('cuda'):    # fixed deprecation warning
+        with torch.amp.autocast(device_type, enabled=(device_type == "cuda")):
             outputs = model(input_ids=input_ids, attention_mask=attn_mask, labels=labels)
             loss    = outputs.loss
             logits  = outputs.logits
