@@ -26,6 +26,7 @@ else
     source .venv/bin/activate
 fi
 
+
 # ── Train ────────────────────────────────────────────────────────────────
 # --auto_resume: starts fresh if OUTPUT_DIR has no checkpoint yet (first
 # run), or auto-detects and resumes from the latest checkpoint_step_*.pt
@@ -33,6 +34,7 @@ fi
 echo "[run.sh] $(date '+%Y-%m-%d %H:%M:%S')  Starting training (auto-resume) → $OUTPUT_DIR" | tee -a "$LOG_FILE"
 python train.py \
     --output_dir "$OUTPUT_DIR" \
-    --batch_size 32 \
+    --batch_size 16 \
+    --grad_accum_steps 16 \
     --auto_resume \
     >> "$LOG_FILE" 2>&1

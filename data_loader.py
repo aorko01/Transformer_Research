@@ -98,7 +98,6 @@ def load_wikipedia_dataset(
         "20231101.en",           # latest stable English dump
         split="train",
         cache_dir=data_dir,      # full download to local disk (memory-mapped Arrow cache)
-        trust_remote_code=True,
     )
     print(f"Full dataset on disk: {len(dataset)} articles. Reading from local disk copy...")
 
