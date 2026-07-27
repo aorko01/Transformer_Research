@@ -9,9 +9,9 @@ class CustomAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
 
         self.d_k=getattr(config,"d_k",128)
-        self.num_groups=getattr(config,"num_groups",32)
-        assert config.block_size % self.num_groups == 0
-        self.group_size=config.block_size // self.num_groups
+        self.group_size=int(math.sqrt(config.block_size))
+        assert self.group_size * self.group_size == config.block_size, "block_size must be a perfect square"
+        self.num_groups=config.block_size // self.group_size
 
         self.Wq=nn.Linear(config.n_embd,self.d_k, bias=False)
         self.Wk=nn.Linear(config.n_embd,self.d_k, bias=False)
