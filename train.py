@@ -1,12 +1,14 @@
 import argparse
+import math
 import os
-import time
 
 import torch
 
 from GPT_Config import ModelConfig, TrainingConfig
 from Dataloader import Dataloader
+from metrics import MetricsTracker
 from model.GPT import GPT
+from model.attention import Attention
 from training_utils import calculate_loss, configure_optimizers, estimate_loss, get_lr
 
 
@@ -19,11 +21,27 @@ def parse_args():
     parser.add_argument("--max_steps", type=int, default=TrainingConfig.max_steps)
     parser.add_argument("--batch_size", type=int, default=TrainingConfig.Batch)
     parser.add_argument("--seq_len", type=int, default=TrainingConfig.Sequence_length)
+    parser.add_argument("--total_batches", type=int, default=TrainingConfig.Total_batches,
+                         help="target tokens per optimizer step (drives gradient accumulation)")
     parser.add_argument("--lr", type=float, default=TrainingConfig.lr)
     parser.add_argument("--seed", type=int, default=TrainingConfig.seed)
     parser.add_argument("--compile", action="store_true", default=True,
                          help="use torch.compile (only takes effect on CUDA)")
     parser.add_argument("--no-compile", dest="compile", action="store_false")
+    parser.add_argument("--eval_interval", type=int, default=TrainingConfig.eval_interval,
+                         help="run validation (and log val loss/perplexity) every N steps")
+    parser.add_argument("--eval_iters", type=int, default=TrainingConfig.eval_iters,
+                         help="number of random batches averaged per validation pass")
+    parser.add_argument("--metrics_path", type=str, default=TrainingConfig.metrics_path,
+                         help="where to write the metrics.json report")
+    parser.add_argument("--log_interval", type=int, default=TrainingConfig.log_interval,
+                         help="append train loss/perplexity to metrics.json every N steps")
+    parser.add_argument("--metrics_warmup_steps", type=int, default=TrainingConfig.metrics_warmup_steps,
+                         help="steps to discard before averaging step time / peak memory")
+    parser.add_argument("--profile_attn", action="store_true", default=True,
+                         help="measure time and peak memory inside the attention layers "
+                              "(forces torch.compile off, since the hooks break the graph)")
+    parser.add_argument("--no-profile_attn", dest="profile_attn", action="store_false")
     return parser.parse_args()
 
 
@@ -39,7 +57,7 @@ def main():
     lr = args.lr
     Batch = args.batch_size
     Sequence_length = args.seq_len
-    Total_batches = TrainingConfig.Total_batches
+    Total_batches = args.total_batches
 
     assert Total_batches % (Batch * Sequence_length) == 0, "Total_batches must be divisible by Batch*Sequence_length"
     grad_accumulation_steps = Total_batches // (Batch * Sequence_length)
@@ -70,20 +88,66 @@ def main():
     )
 
     raw_model = model  # keep an uncompiled reference for clean checkpointing
-    if args.compile and device == "cuda":
+
+    # Per-layer hooks force graph breaks, so attention profiling and torch.compile
+    # can't both be on if the numbers are to describe one consistent execution mode.
+    use_compile = args.compile and device == "cuda" and not args.profile_attn
+    if args.compile and device == "cuda" and args.profile_attn:
+        print("torch.compile disabled: --profile_attn instruments the attention layers "
+              "with hooks, which break the compiled graph. Use --no-profile_attn for "
+              "compiled-throughput numbers.")
+    if use_compile:
         model = torch.compile(model)
+
+    model_config = ModelConfig()
+    tracker = MetricsTracker(
+        path=args.metrics_path,
+        run_info={
+            "device": device,
+            "gpu_name": torch.cuda.get_device_name(0) if device == "cuda" else None,
+            "torch_version": torch.__version__,
+            "autocast_dtype": str(ptdtype),
+            "torch_compile": use_compile,
+            "attention_profiling": args.profile_attn,
+            "seed": args.seed,
+            "num_parameters": sum(p.numel() for p in raw_model.parameters()),
+            "num_parameters_non_embedding": sum(
+                p.numel() for p in raw_model.parameters()
+            ) - raw_model.transformer.wpe.weight.numel(),
+            "model_config": vars(model_config),
+            "batch_size": Batch,
+            "seq_len": Sequence_length,
+            "grad_accumulation_steps": grad_accumulation_steps,
+            "max_steps": max_steps,
+            "max_lr": lr,
+            "min_lr": TrainingConfig.min_lr,
+            "warmup_steps": TrainingConfig.warmup_steps,
+            "eval_interval": args.eval_interval,
+            "eval_iters": args.eval_iters,
+            "data_dir": args.data_dir,
+        },
+        tokens_per_step=Batch * Sequence_length * grad_accumulation_steps,
+        warmup_steps_skipped=args.metrics_warmup_steps,
+        log_interval=args.log_interval,
+        device_type=device_type,
+    )
+    if args.profile_attn:
+        tracker.attach_attention_profiler(raw_model, Attention)
+    print(f"writing metrics to {os.path.abspath(args.metrics_path)}")
 
     best_val_loss = float("inf")
 
     model.train()
-    
+
     for step in range(max_steps):
-        t0 = time.time()
         last_step = step == max_steps - 1
 
-        if step % TrainingConfig.eval_interval == 0 or last_step:
-            val_loss = estimate_loss(model, val_loader, TrainingConfig.eval_iters, device, device_type, ptdtype)
-            print(f"step {step}: val_loss {val_loss:.4f}")
+        if step % args.eval_interval == 0 or last_step:
+            val_loss = estimate_loss(model, val_loader, args.eval_iters, device, device_type, ptdtype)
+            val_ppl = math.exp(val_loss) if val_loss < 20 else float("inf")
+            tracker.log_validation(step, val_loss)
+            tracker.write()
+            print(f"step {step}: val_loss {val_loss:.4f} | val_ppl {val_ppl:.2f}")
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 checkpoint = {
@@ -102,37 +166,61 @@ def main():
         for param_group in optimizer.param_groups:
             param_group["lr"] = step_lr
 
+        # Timed region starts here so the validation pass above is excluded from
+        # the step time and the peak-memory high-water mark.
+        tracker.start_step(step)
+
         optimizer.zero_grad(set_to_none=True)
         loss_accum = 0.0
         # Gradient accumulation: sum gradients over several micro-batches before
         # stepping the optimizer, to simulate a larger effective batch size
         # (Total_batches tokens) than fits in memory at once.
         for micro_step in range(grad_accumulation_steps):
+            tracker.timer.start("data")
             x, y = train_loader.next_batch()
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            tracker.timer.stop("data")
+
+            tracker.timer.start("forward")
             with torch.autocast(device_type=device_type, dtype=ptdtype):
                 logits = model(x)
                 loss = calculate_loss(logits, y)
+            tracker.timer.stop("forward")
+
             loss_accum += loss.detach()
             # average the loss over accumulation steps since gradients add up otherwise
             loss = loss / grad_accumulation_steps
+            tracker.timer.start("backward")
             loss.backward()
+            tracker.timer.stop("backward")
 
         # Clip the global gradient norm to 1.0 to prevent exploding gradients.
+        tracker.timer.start("optimizer")
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        tracker.timer.stop("optimizer")
 
-        if device == "cuda":
-            torch.cuda.synchronize()  # wait for all queued CUDA kernels to finish before timing
-        t1 = time.time()
-        dt = (t1 - t0) * 1000
-        tokens_per_sec = Batch * Sequence_length * grad_accumulation_steps * 1000 / dt
-        print(
-            f"step {step} | loss: {loss_accum.item() / grad_accumulation_steps:.4f} "
-            f"| lr: {step_lr:.2e} | norm: {norm.item():.2f} "
-            f"| tok/sec: {tokens_per_sec:.2f} | time: {dt:.2f}ms"
+        train_loss = loss_accum.item() / grad_accumulation_steps
+        # end_step does the single per-step cuda synchronize and resolves the timers
+        dt, tokens_per_sec, phases = tracker.end_step(
+            step, loss=train_loss, lr=step_lr, grad_norm=norm.item()
         )
+        attn_ms = phases.get("attention_forward", 0.0) + phases.get("attention_backward", 0.0)
+        attn_str = f" | attn: {attn_ms:.2f}ms" if args.profile_attn else ""
+        print(
+            f"step {step} | loss: {train_loss:.4f} "
+            f"| lr: {step_lr:.2e} | norm: {norm.item():.2f} "
+            f"| tok/sec: {tokens_per_sec:.2f} | time: {dt:.2f}ms{attn_str}"
+        )
+
+    tracker.write(status="completed")
+    print(f"wrote metrics to {os.path.abspath(args.metrics_path)}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # metrics.json is rewritten on every logged step, so an interrupted run
+        # still leaves the curves and aggregates collected so far on disk.
+        print("interrupted; metrics.json holds everything up to the last logged step")

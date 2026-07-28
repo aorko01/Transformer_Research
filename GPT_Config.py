@@ -26,3 +26,10 @@ class TrainingConfig:
     data_dir: str = "data/tinystories"
     out_dir: str = "out"
     seed: int = 1337
+
+    # --- metrics.json ---
+    log_interval: int = 10        # append train loss/perplexity to metrics.json every N steps
+    metrics_path: str = "metrics.json"
+    # Step time and peak memory are garbage for the first few steps (allocator warm-up,
+    # cuDNN autotuning, torch.compile tracing), so drop them from the aggregates.
+    metrics_warmup_steps: int = 10
