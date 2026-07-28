@@ -13,9 +13,9 @@ from training_utils import calculate_loss, configure_optimizers, estimate_loss, 
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train a GPT model for causal language modelling on TinyStories")
+    parser = argparse.ArgumentParser(description="Train a GPT model for causal language modelling on WikiText-103")
     parser.add_argument("--data_dir", type=str, default=TrainingConfig.data_dir,
-                         help="directory containing train.bin / val.bin (see data/tinystories/prepare.py)")
+                         help="directory containing train.bin / val.bin (see data/wikitext103/prepare.py)")
     parser.add_argument("--out_dir", type=str, default=TrainingConfig.out_dir,
                          help="directory to write checkpoints to")
     parser.add_argument("--max_steps", type=int, default=TrainingConfig.max_steps)

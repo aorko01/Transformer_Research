@@ -6,17 +6,17 @@ import torch
 
 class Dataloader:
     """
-    Streams (x, y) next-token-prediction batches from a pre-tokenized TinyStories
+    Streams (x, y) next-token-prediction batches from a pre-tokenized WikiText-103
     shard on disk.
 
     Expects `{data_dir}/{split}.bin` to exist, containing uint16 GPT-2 BPE token
-    ids. Generate these files first with `data/tinystories/prepare.py`.
+    ids. Generate these files first with `data/wikitext103/prepare.py`.
 
     We use np.memmap so the tokens never have to be fully loaded into RAM -
-    important since TinyStories tokenizes to hundreds of millions of tokens.
+    important since WikiText-103 tokenizes to hundreds of millions of tokens.
     """
 
-    def __init__(self, B, T, split="train", data_dir="data/tinystories"):
+    def __init__(self, B, T, split="train", data_dir="data/wikitext103"):
         self.B = B
         self.T = T
         assert split in {"train", "val"}, f"split must be 'train' or 'val', got {split!r}"
@@ -26,8 +26,8 @@ class Dataloader:
         self.data_path = os.path.join(data_dir, f"{split}.bin")
         if not os.path.exists(self.data_path):
             raise FileNotFoundError(
-                f"Could not find {self.data_path}. Run `python data/tinystories/prepare.py` "
-                "first to download and tokenize TinyStories."
+                f"Could not find {self.data_path}. Run `python data/wikitext103/prepare.py` "
+                "first to download and tokenize WikiText-103."
             )
 
         # Re-opened as a fresh memmap on every __init__ (cheap - just maps the file,
