@@ -50,12 +50,44 @@ class CustomAttention(nn.Module):
         a_prime=self.attn_dropout(a_prime)                                   # a_prime: (B, g, g)   (unchanged shape)
 
         # Combine local and global attention
-        weighted=a_prime.unsqueeze(-1).unsqueeze(-1) * a.unsqueeze(1)        # a_prime.unsqueeze(-1).unsqueeze(-1): (B, g, g, 1, 1) e.g. (B,32,32,1,1)
-                                                                              # a.unsqueeze(1):                       (B, 1, g, s, s) e.g. (B,1,32,32,32)
-                                                                              # weighted (broadcast product):         (B, g_out=i, g_in=j, s_q=r, s_k=c) e.g. (B, 32, 32, 32, 32)
+        # Concrete toy example: T=8 tokens, num_groups=g=2, group_size=s=4 (so g*s=T=8), batch dropped (b fixed).
+        #   Group 0 = tokens[0:4], Group 1 = tokens[4:8].
+        #   a has shape (g=2, s=4, s=4):  a[0] = a_0 (group 0's own 4x4 local attention matrix), a[1] = a_1 (group 1's own 4x4 local attention matrix)
+        #     a_0 = [[1,0,0,0],
+        #            [0,1,0,0],
+        #            [0,0,1,0],
+        #            [0,0,0,1]]
+        #     a_1 = [[.25,.25,.25,.25],
+        #            [.25,.25,.25,.25],
+        #            [.25,.25,.25,.25],
+        #            [.25,.25,.25,.25]]
+        #   a_prime has shape (g=2, g=2):  a_prime = [[0.7, 0.3], [0.4, 0.6]]   (a_prime[i,j] = how much output group i attends to group j)
+        #   Goal for output group i=0: scale each FULL local matrix by the scalar a_prime[0,j], then concat side by side (horizontally):
+        #     t_0 = [ a_prime[0,0]*a_0 , a_prime[0,1]*a_1 ]
+        #         = [ 0.7*[[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]] , 0.3*[[.25,.25,.25,.25],[.25,.25,.25,.25],[.25,.25,.25,.25],[.25,.25,.25,.25]] ]
+        #     which multiplies out to the (s=4, T=8) matrix:
+        #         [[0.7,0,0,0,   .075,.075,.075,.075],
+        #          [0,0.7,0,0,   .075,.075,.075,.075],
+        #          [0,0,0.7,0,   .075,.075,.075,.075],
+        #          [0,0,0,0.7,   .075,.075,.075,.075]]
+        #     (each row sums to 1, e.g. row0: 0.7 + 4*0.075 = 1.0)
+        weighted=a_prime.unsqueeze(-1).unsqueeze(-1) * a.unsqueeze(1)        # a_prime.unsqueeze(-1).unsqueeze(-1): (g,g,1,1) = (2,2,1,1)  -> a_prime[i,j] broadcast-ready to scale a WHOLE (r,c) matrix
+                                                                              # a.unsqueeze(1):                       (1,g,s,s) = (1,2,4,4)  -> a[j] (each full 4x4 matrix) broadcast-ready over i
+                                                                              # weighted (broadcast product):         (g_out=i, g_in=j, s_q=r, s_k=c) = (2,2,4,4)
+                                                                              # weighted[i,j,:,:] = a_prime[i,j] * a[j,:,:]   <- for fixed i,j this is the WHOLE scaled matrix a_prime[i,j]*a_j, not just one row
+                                                                              # for i=0: weighted[0,0,:,:] = 0.7*a_0 = [[0.7,0,0,0],[0,0.7,0,0],[0,0,0.7,0],[0,0,0,0.7]]
+                                                                              #          weighted[0,1,:,:] = 0.3*a_1 = [[.075,.075,.075,.075], ... (4 identical rows)]
+                                                                              # i.e. fixing i=0, varying j=0,1 gives exactly the 2 bracketed FULL matrices of t_0 above, just stacked on a separate j axis (not concatenated yet)
         t=weighted.permute(0,1,3,2,4).reshape(Batch,num_groups,self.group_size,Token)
-                                                                              # permute(0,1,3,2,4): (B, i, r, j, c)   e.g. (B, 32, 32, 32, 32)
-                                                                              # reshape (flatten j,c -> T):  t: (B, g, s, T)  e.g. (B, 32, 32, 1024)
+                                                                              # permute(0,1,3,2,4): (B,i,r,j,c) = (B,2,4,2,4)  -> moves j,c next to each other, in (j,c) order
+                                                                              # reshape (flatten j,c -> T=8):  t: (B,g,s,T) = (B,2,4,8)
+                                                                              # flattening (j,c) with j-major, c-minor horizontally concatenates the FULL matrices column-wise:
+                                                                              #   t[b,0,:,:] = [ weighted[b,0,0,:,:] | weighted[b,0,1,:,:] ]  (side by side, 4x4 next to 4x4 -> 4x8)
+                                                                              #              = [[0.7,0,0,0,  .075,.075,.075,.075],
+                                                                              #                 [0,0.7,0,0,  .075,.075,.075,.075],
+                                                                              #                 [0,0,0.7,0,  .075,.075,.075,.075],
+                                                                              #                 [0,0,0,0.7,  .075,.075,.075,.075]]     <- matches t_0 computed above exactly
+                                                                              # this IS t_0, the full (s=4, T=8) matrix for output group i=0 (reading out row r gives the earlier per-row formula, they're the same tensor)
 
         y=t @ V.unsqueeze(1)                                                 # V.unsqueeze(1): (B, 1, T, d_k) e.g. (B,1,1024,128)
                                                                               # y = t @ V:      (B, g, s, d_k) e.g. (B, 32, 32, 128)
@@ -63,3 +95,4 @@ class CustomAttention(nn.Module):
         y=y.reshape(Batch,Token,Embedding)                                   # y: (B, T, D)                   e.g. (B, 1024, 768)
         y=self.resid_dropout(y)                                              # y: (B, T, D)   (unchanged shape)
         return y
+    
