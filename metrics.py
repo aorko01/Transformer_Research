@@ -15,6 +15,10 @@ Timing on CUDA uses CUDA events instead of `time.perf_counter()`: kernel launche
 are asynchronous, so a host-side timer around a launch measures the launch, not
 the work. Events are recorded in-stream and resolved once per step after a single
 `torch.cuda.synchronize()`, which keeps the instrumentation off the critical path.
+
+`MetricsTracker.resume()` lets a restarted training run continue the same
+`metrics.json` (curves + aggregate samples) instead of starting a fresh report -
+see its docstring below.
 """
 
 import json
@@ -27,6 +31,25 @@ from datetime import datetime, timezone
 import torch
 
 MIB = 1024 ** 2
+
+
+def _trim_by_step(values, steps, start_step):
+    """
+    Keep only the samples in `values` whose parallel `steps` entry is before
+    `start_step`. Used by `MetricsTracker.resume()` so raw samples for steps
+    that get re-measured after a crash/restart aren't double-counted in the
+    aggregates. Falls back to keeping everything unfiltered if `steps` is
+    missing or mismatched in length (e.g. an older metrics.json written before
+    step-tagging was added) - better to slightly overcount than silently drop
+    real samples.
+    """
+    if not steps or len(steps) != len(values):
+        return list(values), list(steps)
+    kept = [(v, s) for v, s in zip(values, steps) if s < start_step]
+    if not kept:
+        return [], []
+    vals, kept_steps = zip(*kept)
+    return list(vals), list(kept_steps)
 
 
 def _summarize(values):
@@ -208,6 +231,11 @@ class MetricsTracker:
 
     `end_step` performs the single per-step CUDA synchronize, so the caller should
     not add another one.
+
+    For a fresh run, construct normally with `MetricsTracker(...)`. For a run
+    resumed from a checkpoint, use `MetricsTracker.resume(...)` instead so the
+    new process continues the same curves and aggregate samples rather than
+    starting `metrics.json` over from nothing.
     """
 
     def __init__(self, path, run_info, tokens_per_step, warmup_steps_skipped,
@@ -231,14 +259,21 @@ class MetricsTracker:
         self.train_curve = []
         self.val_curve = []
 
-        # aggregate samples, only collected for steps >= warmup_steps_skipped
+        # aggregate samples, only collected for steps >= warmup_steps_skipped.
+        # Each sample list has a parallel "*_steps" list recording which global
+        # step it came from, so resume() can trim out steps that get re-measured
+        # after a crash/restart instead of double-counting them.
         self._step_ms = []
+        self._step_ms_steps = []
         self._tokens_per_sec = []
         self._phase_ms = {}
+        self._phase_steps = {}
         self._attn_forward_ms = []
         self._attn_backward_ms = []
+        self._attn_steps = []
         self._step_peak_alloc = []
         self._step_peak_reserved = []
+        self._peak_steps = []
         self._attn_peak_absolute = 0
         self._attn_peak_delta = 0
         self._peak_alloc = 0
@@ -247,6 +282,100 @@ class MetricsTracker:
         self._t0 = None
         self._measuring = False
         self._wall_start = time.time()
+
+    @classmethod
+    def resume(cls, path, run_info, tokens_per_step, warmup_steps_skipped,
+               log_interval, device_type, start_step=0):
+        """
+        Reconstruct a MetricsTracker from an existing `metrics.json`, so a
+        resumed training run continues the same curves and aggregate samples
+        instead of starting a fresh report at `start_step`.
+
+        Falls back to a normal, empty tracker if `path` doesn't exist yet
+        (e.g. resuming a checkpoint from a run that never got far enough to
+        write metrics).
+
+        `start_step` is the step the resumed run will begin at (i.e. the
+        checkpoint's `step + 1`). Any prior curve entries at or beyond that
+        step are dropped - if the checkpoint being resumed from was saved
+        after the last metrics.json flush (or the process crashed between the
+        two), this avoids duplicate/stale entries once training continues.
+        """
+        tracker = cls(path, run_info, tokens_per_step, warmup_steps_skipped,
+                      log_interval, device_type)
+
+        if not os.path.exists(path):
+            return tracker
+
+        with open(path) as handle:
+            prior = json.load(handle)
+
+        # Keep the original run's start time so elapsed_wall_clock_sec spans
+        # the whole job rather than resetting on every restart; keep a
+        # breadcrumb of every resume instead.
+        prior_run = prior.get("run", {})
+        if "started_at" in prior_run:
+            tracker.run_info["started_at"] = prior_run["started_at"]
+        resumed_at = list(prior_run.get("resumed_at", []))
+        resumed_at.append(datetime.now(timezone.utc).isoformat(timespec="seconds"))
+        tracker.run_info["resumed_at"] = resumed_at
+
+        tracker.train_curve = [row for row in prior.get("train", []) if row["step"] < start_step]
+        tracker.val_curve = [row for row in prior.get("val", []) if row["step"] < start_step]
+
+        raw = prior.get("_raw_samples", {})
+
+        # step_ms / tokens_per_sec are always sampled together (same steps)
+        step_ms, step_ms_steps = _trim_by_step(
+            raw.get("step_ms", []), raw.get("step_ms_steps", []), start_step
+        )
+        tokens_per_sec, _ = _trim_by_step(
+            raw.get("tokens_per_sec", []), raw.get("step_ms_steps", []), start_step
+        )
+        tracker._step_ms = step_ms
+        tracker._step_ms_steps = step_ms_steps
+        tracker._tokens_per_sec = tokens_per_sec
+
+        phase_ms = {}
+        phase_steps = {}
+        prior_phase_steps = raw.get("phase_steps", {})
+        for label, values in raw.get("phase_ms", {}).items():
+            trimmed_values, trimmed_steps = _trim_by_step(
+                values, prior_phase_steps.get(label, []), start_step
+            )
+            phase_ms[label] = trimmed_values
+            phase_steps[label] = trimmed_steps
+        tracker._phase_ms = phase_ms
+        tracker._phase_steps = phase_steps
+
+        # step_peak_alloc / step_peak_reserved are always sampled together
+        peak_alloc, peak_steps = _trim_by_step(
+            raw.get("step_peak_alloc", []), raw.get("peak_steps", []), start_step
+        )
+        peak_reserved, _ = _trim_by_step(
+            raw.get("step_peak_reserved", []), raw.get("peak_steps", []), start_step
+        )
+        tracker._step_peak_alloc = peak_alloc
+        tracker._step_peak_reserved = peak_reserved
+        tracker._peak_steps = peak_steps
+
+        # attn_forward_ms / attn_backward_ms are always sampled together
+        attn_forward, attn_steps = _trim_by_step(
+            raw.get("attn_forward_ms", []), raw.get("attn_steps", []), start_step
+        )
+        attn_backward, _ = _trim_by_step(
+            raw.get("attn_backward_ms", []), raw.get("attn_steps", []), start_step
+        )
+        tracker._attn_forward_ms = attn_forward
+        tracker._attn_backward_ms = attn_backward
+        tracker._attn_steps = attn_steps
+
+        # These are running maxima, not summed/averaged samples, so the overlap
+        # window can't double-count them - carry them forward as-is.
+        tracker._attn_peak_absolute = raw.get("attn_peak_absolute", 0)
+        tracker._attn_peak_delta = raw.get("attn_peak_delta", 0)
+
+        return tracker
 
     def attach_attention_profiler(self, model, module_cls):
         self.attention = AttentionProfiler(model, module_cls, self.timer, self)
@@ -289,15 +418,19 @@ class MetricsTracker:
 
         if self._measuring:
             self._step_ms.append(step_ms)
+            self._step_ms_steps.append(step)
             self._tokens_per_sec.append(tokens_per_sec)
             for label, value in phases.items():
                 self._phase_ms.setdefault(label, []).append(value)
+                self._phase_steps.setdefault(label, []).append(step)
             if self.cuda:
                 self._step_peak_alloc.append(self._peak_alloc)
                 self._step_peak_reserved.append(self._peak_reserved)
+                self._peak_steps.append(step)
             if self.attention is not None:
                 self._attn_forward_ms.append(phases.get("attention_forward", 0.0))
                 self._attn_backward_ms.append(phases.get("attention_backward", 0.0))
+                self._attn_steps.append(step)
                 self._attn_peak_absolute = max(self._attn_peak_absolute, self.attention.peak_absolute)
                 self._attn_peak_delta = max(self._attn_peak_delta, self.attention.peak_delta)
 
@@ -332,7 +465,8 @@ class MetricsTracker:
             "measured_steps": len(self._step_ms),
             "note": (
                 f"the first {self.warmup_steps_skipped} steps are excluded; "
-                "times are per optimizer step (all gradient-accumulation micro-steps)"
+                "times are per optimizer step (all gradient-accumulation micro-steps); "
+                "spans every resumed process sharing this metrics.json, not just the current one"
             ),
             "step_time_ms": _summarize(self._step_ms),
             "tokens_per_sec": _summarize(self._tokens_per_sec),
@@ -387,12 +521,35 @@ class MetricsTracker:
 
         return out
 
+    def _raw_samples(self):
+        """
+        The per-step sample lists that `aggregates()` is computed from. Persisted
+        alongside the curves so `resume()` can reconstruct exact aggregates across
+        a restart instead of only aggregating the current process's steps.
+        """
+        return {
+            "step_ms": self._step_ms,
+            "step_ms_steps": self._step_ms_steps,
+            "tokens_per_sec": self._tokens_per_sec,
+            "phase_ms": self._phase_ms,
+            "phase_steps": self._phase_steps,
+            "step_peak_alloc": self._step_peak_alloc,
+            "step_peak_reserved": self._step_peak_reserved,
+            "peak_steps": self._peak_steps,
+            "attn_forward_ms": self._attn_forward_ms,
+            "attn_backward_ms": self._attn_backward_ms,
+            "attn_steps": self._attn_steps,
+            "attn_peak_absolute": self._attn_peak_absolute,
+            "attn_peak_delta": self._attn_peak_delta,
+        }
+
     def snapshot(self):
         return {
             "run": self.run_info,
             "aggregates": self.aggregates(),
             "train": self.train_curve,
             "val": self.val_curve,
+            "_raw_samples": self._raw_samples(),
         }
 
     def write(self, status="running"):

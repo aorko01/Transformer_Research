@@ -42,7 +42,29 @@ def parse_args():
                          help="measure time and peak memory inside the attention layers "
                               "(forces torch.compile off, since the hooks break the graph)")
     parser.add_argument("--no-profile_attn", dest="profile_attn", action="store_false")
+    parser.add_argument("--ckpt_interval", type=int, default=getattr(TrainingConfig, "ckpt_interval", 500),
+                         help="save a 'latest' checkpoint (for --resume) every N steps, in addition to "
+                              "the best-val-loss checkpoint")
+    parser.add_argument("--resume", type=str, default=None,
+                         help="path to a checkpoint to resume from (restores model, optimizer, step, "
+                              "dataloader position, and RNG state)")
     return parser.parse_args()
+
+
+def build_checkpoint(raw_model, optimizer, step, val_loss, best_val_loss, train_loader):
+    return {
+        "model": raw_model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "step": step,
+        "val_loss": val_loss,
+        "best_val_loss": best_val_loss,
+        "model_config": ModelConfig(),
+        # sequential offset into train_loader's token stream, so resuming
+        # continues from here instead of restarting at the beginning of the data
+        "train_loader_position": train_loader.current_position,
+        "rng_state": torch.get_rng_state(),
+        "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
 
 
 def main():
@@ -89,6 +111,21 @@ def main():
 
     raw_model = model  # keep an uncompiled reference for clean checkpointing
 
+    start_step = 0
+    best_val_loss = float("inf")
+    if args.resume:
+        print(f"resuming from checkpoint: {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        raw_model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        start_step = ckpt["step"] + 1
+        best_val_loss = ckpt.get("best_val_loss", float("inf"))
+        train_loader.current_position = ckpt.get("train_loader_position", 0)
+        torch.set_rng_state(ckpt["rng_state"])
+        if ckpt.get("cuda_rng_state") is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(ckpt["cuda_rng_state"])
+        print(f"resumed at step {start_step}, best_val_loss so far: {best_val_loss:.4f}")
+
     # Per-layer hooks force graph breaks, so attention profiling and torch.compile
     # can't both be on if the numbers are to describe one consistent execution mode.
     use_compile = args.compile and device == "cuda" and not args.profile_attn
@@ -100,7 +137,7 @@ def main():
         model = torch.compile(model)
 
     model_config = ModelConfig()
-    tracker = MetricsTracker(
+    tracker_kwargs = dict(
         path=args.metrics_path,
         run_info={
             "device": device,
@@ -131,15 +168,21 @@ def main():
         log_interval=args.log_interval,
         device_type=device_type,
     )
+    if args.resume:
+        tracker = MetricsTracker.resume(start_step=start_step, **tracker_kwargs)
+    else:
+        tracker = MetricsTracker(**tracker_kwargs)
     if args.profile_attn:
         tracker.attach_attention_profiler(raw_model, Attention)
     print(f"writing metrics to {os.path.abspath(args.metrics_path)}")
 
-    best_val_loss = float("inf")
+    # holds the most recently computed validation loss, so the periodic "latest"
+    # checkpoint below always has a value to record even between eval_interval steps
+    val_loss = best_val_loss if best_val_loss != float("inf") else float("nan")
 
     model.train()
 
-    for step in range(max_steps):
+    for step in range(start_step, max_steps):
         last_step = step == max_steps - 1
 
         if step % args.eval_interval == 0 or last_step:
@@ -150,16 +193,12 @@ def main():
             print(f"step {step}: val_loss {val_loss:.4f} | val_ppl {val_ppl:.2f}")
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                checkpoint = {
-                    "model": raw_model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "step": step,
-                    "val_loss": val_loss,
-                    "model_config": ModelConfig(),
-                }
-                ckpt_path = os.path.join(args.out_dir, "ckpt.pt")
-                torch.save(checkpoint, ckpt_path)
-                print(f"saved checkpoint to {ckpt_path}")
+                best_ckpt_path = os.path.join(args.out_dir, "ckpt_best.pt")
+                torch.save(
+                    build_checkpoint(raw_model, optimizer, step, val_loss, best_val_loss, train_loader),
+                    best_ckpt_path,
+                )
+                print(f"saved best checkpoint to {best_ckpt_path}")
 
         # linear warmup + cosine decay
         step_lr = get_lr(step, TrainingConfig.warmup_steps, max_steps, lr, TrainingConfig.min_lr)
@@ -212,6 +251,14 @@ def main():
             f"| lr: {step_lr:.2e} | norm: {norm.item():.2f} "
             f"| tok/sec: {tokens_per_sec:.2f} | time: {dt:.2f}ms{attn_str}"
         )
+
+        if step % args.ckpt_interval == 0 or last_step:
+            latest_ckpt_path = os.path.join(args.out_dir, "ckpt_latest.pt")
+            torch.save(
+                build_checkpoint(raw_model, optimizer, step, val_loss, best_val_loss, train_loader),
+                latest_ckpt_path,
+            )
+            print(f"saved latest checkpoint to {latest_ckpt_path}")
 
     tracker.write(status="completed")
     print(f"wrote metrics to {os.path.abspath(args.metrics_path)}")
