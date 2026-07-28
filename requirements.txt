@@ -3,3 +3,5 @@ pytest
 tiktoken
 requests
 numpy
+datasets
+tqdm
