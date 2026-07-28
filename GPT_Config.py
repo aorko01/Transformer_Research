@@ -23,7 +23,7 @@ class TrainingConfig:
     Total_batches: int = 524288   # target tokens per optimizer step (drives grad accumulation)
     eval_interval: int = 250      # run validation every N steps
     eval_iters: int = 100         # number of random batches averaged per validation pass
-    data_dir: str = "data/tinystories"
+    data_dir: str = "data/wikitext103"
     out_dir: str = "out"
     seed: int = 1337
 

@@ -13,9 +13,9 @@ from training_utils import calculate_loss, configure_optimizers, estimate_loss, 
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train a GPT model for causal language modelling on WikiText-103")
+    parser = argparse.ArgumentParser(description="Train a GPT model for causal language modelling on TinyStories")
     parser.add_argument("--data_dir", type=str, default=TrainingConfig.data_dir,
-                         help="directory containing train.bin / val.bin (see data/wikitext103/prepare.py)")
+                         help="directory containing train.bin / val.bin (see data/tinystories/prepare.py)")
     parser.add_argument("--out_dir", type=str, default=TrainingConfig.out_dir,
                          help="directory to write checkpoints to")
     parser.add_argument("--max_steps", type=int, default=TrainingConfig.max_steps)
@@ -47,7 +47,12 @@ def parse_args():
                               "the best-val-loss checkpoint")
     parser.add_argument("--resume", type=str, default=None,
                          help="path to a checkpoint to resume from (restores model, optimizer, step, "
-                              "dataloader position, and RNG state)")
+                              "dataloader position, and RNG state). If omitted, train.py will "
+                              "automatically resume from <out_dir>/ckpt_latest.pt if that file exists, "
+                              "otherwise it starts from scratch. Pass --no_resume to force a fresh run "
+                              "even if a checkpoint is present.")
+    parser.add_argument("--no_resume", action="store_true", default=False,
+                         help="ignore any existing checkpoint in out_dir and start from scratch")
     return parser.parse_args()
 
 
@@ -95,6 +100,23 @@ def main():
 
     os.makedirs(args.out_dir, exist_ok=True)
 
+    # --- Auto-resume logic -------------------------------------------------
+    # If the user didn't explicitly pass --resume, look for the "latest"
+    # checkpoint that gets written every --ckpt_interval steps. If it exists,
+    # resume from it automatically; otherwise start fresh. --no_resume
+    # overrides this and always starts from scratch, even if a checkpoint
+    # file is sitting in out_dir.
+    resume_path = args.resume
+    auto_ckpt_path = os.path.join(args.out_dir, "ckpt_latest.pt")
+    if args.no_resume:
+        resume_path = None
+        if os.path.exists(auto_ckpt_path):
+            print(f"--no_resume set: ignoring existing checkpoint at {auto_ckpt_path}")
+    elif resume_path is None and os.path.exists(auto_ckpt_path):
+        resume_path = auto_ckpt_path
+        print(f"found existing checkpoint at {auto_ckpt_path}; resuming automatically")
+    # ------------------------------------------------------------------------
+
     # Data
     train_loader = Dataloader(B=Batch, T=Sequence_length, split="train", data_dir=args.data_dir)
     val_loader = Dataloader(B=Batch, T=Sequence_length, split="val", data_dir=args.data_dir)
@@ -113,9 +135,9 @@ def main():
 
     start_step = 0
     best_val_loss = float("inf")
-    if args.resume:
-        print(f"resuming from checkpoint: {args.resume}")
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+    if resume_path:
+        print(f"resuming from checkpoint: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
         raw_model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_step = ckpt["step"] + 1
@@ -125,6 +147,8 @@ def main():
         if ckpt.get("cuda_rng_state") is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(ckpt["cuda_rng_state"])
         print(f"resumed at step {start_step}, best_val_loss so far: {best_val_loss:.4f}")
+    else:
+        print("no checkpoint found (or --no_resume set); starting from scratch")
 
     # Per-layer hooks force graph breaks, so attention profiling and torch.compile
     # can't both be on if the numbers are to describe one consistent execution mode.
@@ -168,7 +192,7 @@ def main():
         log_interval=args.log_interval,
         device_type=device_type,
     )
-    if args.resume:
+    if resume_path:
         tracker = MetricsTracker.resume(start_step=start_step, **tracker_kwargs)
     else:
         tracker = MetricsTracker(**tracker_kwargs)
