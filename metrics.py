@@ -33,6 +33,25 @@ import torch
 MIB = 1024 ** 2
 
 
+def _trim_by_step(values, steps, start_step):
+    """
+    Keep only the samples in `values` whose parallel `steps` entry is before
+    `start_step`. Used by `MetricsTracker.resume()` so raw samples for steps
+    that get re-measured after a crash/restart aren't double-counted in the
+    aggregates. Falls back to keeping everything unfiltered if `steps` is
+    missing or mismatched in length (e.g. an older metrics.json written before
+    step-tagging was added) - better to slightly overcount than silently drop
+    real samples.
+    """
+    if not steps or len(steps) != len(values):
+        return list(values), list(steps)
+    kept = [(v, s) for v, s in zip(values, steps) if s < start_step]
+    if not kept:
+        return [], []
+    vals, kept_steps = zip(*kept)
+    return list(vals), list(kept_steps)
+
+
 def _summarize(values):
     """mean/std/median/min/max/p90 for a list of samples (None if empty)."""
     if not values:
@@ -240,14 +259,21 @@ class MetricsTracker:
         self.train_curve = []
         self.val_curve = []
 
-        # aggregate samples, only collected for steps >= warmup_steps_skipped
+        # aggregate samples, only collected for steps >= warmup_steps_skipped.
+        # Each sample list has a parallel "*_steps" list recording which global
+        # step it came from, so resume() can trim out steps that get re-measured
+        # after a crash/restart instead of double-counting them.
         self._step_ms = []
+        self._step_ms_steps = []
         self._tokens_per_sec = []
         self._phase_ms = {}
+        self._phase_steps = {}
         self._attn_forward_ms = []
         self._attn_backward_ms = []
+        self._attn_steps = []
         self._step_peak_alloc = []
         self._step_peak_reserved = []
+        self._peak_steps = []
         self._attn_peak_absolute = 0
         self._attn_peak_delta = 0
         self._peak_alloc = 0
@@ -298,13 +324,54 @@ class MetricsTracker:
         tracker.val_curve = [row for row in prior.get("val", []) if row["step"] < start_step]
 
         raw = prior.get("_raw_samples", {})
-        tracker._step_ms = list(raw.get("step_ms", []))
-        tracker._tokens_per_sec = list(raw.get("tokens_per_sec", []))
-        tracker._phase_ms = {k: list(v) for k, v in raw.get("phase_ms", {}).items()}
-        tracker._step_peak_alloc = list(raw.get("step_peak_alloc", []))
-        tracker._step_peak_reserved = list(raw.get("step_peak_reserved", []))
-        tracker._attn_forward_ms = list(raw.get("attn_forward_ms", []))
-        tracker._attn_backward_ms = list(raw.get("attn_backward_ms", []))
+
+        # step_ms / tokens_per_sec are always sampled together (same steps)
+        step_ms, step_ms_steps = _trim_by_step(
+            raw.get("step_ms", []), raw.get("step_ms_steps", []), start_step
+        )
+        tokens_per_sec, _ = _trim_by_step(
+            raw.get("tokens_per_sec", []), raw.get("step_ms_steps", []), start_step
+        )
+        tracker._step_ms = step_ms
+        tracker._step_ms_steps = step_ms_steps
+        tracker._tokens_per_sec = tokens_per_sec
+
+        phase_ms = {}
+        phase_steps = {}
+        prior_phase_steps = raw.get("phase_steps", {})
+        for label, values in raw.get("phase_ms", {}).items():
+            trimmed_values, trimmed_steps = _trim_by_step(
+                values, prior_phase_steps.get(label, []), start_step
+            )
+            phase_ms[label] = trimmed_values
+            phase_steps[label] = trimmed_steps
+        tracker._phase_ms = phase_ms
+        tracker._phase_steps = phase_steps
+
+        # step_peak_alloc / step_peak_reserved are always sampled together
+        peak_alloc, peak_steps = _trim_by_step(
+            raw.get("step_peak_alloc", []), raw.get("peak_steps", []), start_step
+        )
+        peak_reserved, _ = _trim_by_step(
+            raw.get("step_peak_reserved", []), raw.get("peak_steps", []), start_step
+        )
+        tracker._step_peak_alloc = peak_alloc
+        tracker._step_peak_reserved = peak_reserved
+        tracker._peak_steps = peak_steps
+
+        # attn_forward_ms / attn_backward_ms are always sampled together
+        attn_forward, attn_steps = _trim_by_step(
+            raw.get("attn_forward_ms", []), raw.get("attn_steps", []), start_step
+        )
+        attn_backward, _ = _trim_by_step(
+            raw.get("attn_backward_ms", []), raw.get("attn_steps", []), start_step
+        )
+        tracker._attn_forward_ms = attn_forward
+        tracker._attn_backward_ms = attn_backward
+        tracker._attn_steps = attn_steps
+
+        # These are running maxima, not summed/averaged samples, so the overlap
+        # window can't double-count them - carry them forward as-is.
         tracker._attn_peak_absolute = raw.get("attn_peak_absolute", 0)
         tracker._attn_peak_delta = raw.get("attn_peak_delta", 0)
 
@@ -351,15 +418,19 @@ class MetricsTracker:
 
         if self._measuring:
             self._step_ms.append(step_ms)
+            self._step_ms_steps.append(step)
             self._tokens_per_sec.append(tokens_per_sec)
             for label, value in phases.items():
                 self._phase_ms.setdefault(label, []).append(value)
+                self._phase_steps.setdefault(label, []).append(step)
             if self.cuda:
                 self._step_peak_alloc.append(self._peak_alloc)
                 self._step_peak_reserved.append(self._peak_reserved)
+                self._peak_steps.append(step)
             if self.attention is not None:
                 self._attn_forward_ms.append(phases.get("attention_forward", 0.0))
                 self._attn_backward_ms.append(phases.get("attention_backward", 0.0))
+                self._attn_steps.append(step)
                 self._attn_peak_absolute = max(self._attn_peak_absolute, self.attention.peak_absolute)
                 self._attn_peak_delta = max(self._attn_peak_delta, self.attention.peak_delta)
 
@@ -458,12 +529,16 @@ class MetricsTracker:
         """
         return {
             "step_ms": self._step_ms,
+            "step_ms_steps": self._step_ms_steps,
             "tokens_per_sec": self._tokens_per_sec,
             "phase_ms": self._phase_ms,
+            "phase_steps": self._phase_steps,
             "step_peak_alloc": self._step_peak_alloc,
             "step_peak_reserved": self._step_peak_reserved,
+            "peak_steps": self._peak_steps,
             "attn_forward_ms": self._attn_forward_ms,
             "attn_backward_ms": self._attn_backward_ms,
+            "attn_steps": self._attn_steps,
             "attn_peak_absolute": self._attn_peak_absolute,
             "attn_peak_delta": self._attn_peak_delta,
         }
