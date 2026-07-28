@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 class CustomAttention(nn.Module):
     def __init__(self,config):
@@ -50,6 +51,28 @@ class CustomAttention(nn.Module):
         a_prime=self.attn_dropout(a_prime)                                   # a_prime: (B, g, g)   (unchanged shape)
 
         # Combine local and global attention
+        # Memory note: the combine step materializes 'weighted' (B,g,g,s,s) and 't' (B,g,s,T) — together ~2M
+        # elements per sample (e.g. 2 x (B,32,32,32,32)-ish), which is the same order as a full T x T = 1024x1024
+        # attention matrix. Keeping them alive for backprop would defeat the point of hierarchical attention.
+        # So during training the combine is wrapped in torch.utils.checkpoint: after the forward pass only the
+        # inputs (a = locals, a_prime = globals, V) are saved, 'weighted' and 't' are freed immediately, and they
+        # are regenerated on the fly during backprop. Costs one extra forward of this (cheap) segment; saves the
+        # two big tensors per layer.
+        if self.training and torch.is_grad_enabled():
+            y=checkpoint(self._combine, a, a_prime, V, use_reentrant=False)  # y: (B, g, s, d_k)             e.g. (B, 32, 32, 128)
+        else:
+            y=self._combine(a, a_prime, V)                                   # y: (B, g, s, d_k)             e.g. (B, 32, 32, 128)
+        y=self.c_proj(y)                                                     # y: (B, g, s, D)                e.g. (B, 32, 32, 768)
+        y=y.reshape(Batch,Token,Embedding)                                   # y: (B, T, D)                   e.g. (B, 1024, 768)
+        y=self.resid_dropout(y)                                              # y: (B, T, D)   (unchanged shape)
+        return y
+
+    def _combine(self, a, a_prime, V):
+        # Recomputable segment (checkpointed during training): builds the hierarchical attention rows t and
+        # applies them to V. Inputs are only the locals (a), globals (a_prime) and values (V); everything
+        # created inside is freed after forward and regenerated on the fly during backprop.
+        Batch,num_groups,group_size,_=a.shape
+        Token=V.shape[1]
         # Concrete toy example: T=8 tokens, num_groups=g=2, group_size=s=4 (so g*s=T=8), batch dropped (b fixed).
         #   Group 0 = tokens[0:4], Group 1 = tokens[4:8].
         #   a has shape (g=2, s=4, s=4):  a[0] = a_0 (group 0's own 4x4 local attention matrix), a[1] = a_1 (group 1's own 4x4 local attention matrix)
@@ -78,7 +101,7 @@ class CustomAttention(nn.Module):
                                                                               # for i=0: weighted[0,0,:,:] = 0.7*a_0 = [[0.7,0,0,0],[0,0.7,0,0],[0,0,0.7,0],[0,0,0,0.7]]
                                                                               #          weighted[0,1,:,:] = 0.3*a_1 = [[.075,.075,.075,.075], ... (4 identical rows)]
                                                                               # i.e. fixing i=0, varying j=0,1 gives exactly the 2 bracketed FULL matrices of t_0 above, just stacked on a separate j axis (not concatenated yet)
-        t=weighted.permute(0,1,3,2,4).reshape(Batch,num_groups,self.group_size,Token)
+        t=weighted.permute(0,1,3,2,4).reshape(Batch,num_groups,group_size,Token)
                                                                               # permute(0,1,3,2,4): (B,i,r,j,c) = (B,2,4,2,4)  -> moves j,c next to each other, in (j,c) order
                                                                               # reshape (flatten j,c -> T=8):  t: (B,g,s,T) = (B,2,4,8)
                                                                               # flattening (j,c) with j-major, c-minor horizontally concatenates the FULL matrices column-wise:
@@ -91,8 +114,4 @@ class CustomAttention(nn.Module):
 
         y=t @ V.unsqueeze(1)                                                 # V.unsqueeze(1): (B, 1, T, d_k) e.g. (B,1,1024,128)
                                                                               # y = t @ V:      (B, g, s, d_k) e.g. (B, 32, 32, 128)
-        y=self.c_proj(y)                                                     # y: (B, g, s, D)                e.g. (B, 32, 32, 768)
-        y=y.reshape(Batch,Token,Embedding)                                   # y: (B, T, D)                   e.g. (B, 1024, 768)
-        y=self.resid_dropout(y)                                              # y: (B, T, D)   (unchanged shape)
         return y
-    
