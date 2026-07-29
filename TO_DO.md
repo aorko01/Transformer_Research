@@ -3,6 +3,7 @@
 ## Open Items / Fixes Needed
 - [ ] Fix the cusotm attention  
 - [ ] while scaling need to consider the max learning rate 
+- [ ] for profiling need to change the attention layer for profiling only swapping the attention would give incorrect results
 ---
 
 ## 1. Model Quality Metrics ("does it still work")

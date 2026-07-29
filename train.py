@@ -1,14 +1,13 @@
 import argparse
-import math
 import os
 
 import torch
 
 from GPT_Config import ModelConfig, TrainingConfig
 from Dataloader import Dataloader
-from metrics import MetricsTracker
+from metrics import MetricsTracker, safe_exp
 from model.GPT import GPT
-from model.attention import Attention
+from model.attention_registry import BaseAttention, available_attentions
 from training_utils import calculate_loss, configure_optimizers, estimate_loss, get_lr
 
 
@@ -53,27 +52,48 @@ def parse_args():
                               "even if a checkpoint is present.")
     parser.add_argument("--no_resume", action="store_true", default=False,
                          help="ignore any existing checkpoint in out_dir and start from scratch")
+    parser.add_argument("--attention", type=str, default=None,
+                         help="which attention implementation to train with (default: "
+                              f"{ModelConfig.attention!r}). Registered names are discovered from "
+                              "the model/ package; an out-of-package implementation can be given "
+                              "as 'package.module:ClassName'. See --list_attentions.")
+    parser.add_argument("--list_attentions", action="store_true", default=False,
+                         help="print the attention implementations registered in model/ and exit")
     return parser.parse_args()
 
 
-def build_checkpoint(raw_model, optimizer, step, val_loss, best_val_loss, train_loader):
+def build_checkpoint(raw_model, optimizer, step, val_loss, best_val_loss, train_loader, tracker,
+                     model_config):
     return {
         "model": raw_model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "step": step,
         "val_loss": val_loss,
         "best_val_loss": best_val_loss,
-        "model_config": ModelConfig(),
+        # the config the weights were actually built from, so a resume can tell
+        # which attention implementation this state_dict belongs to
+        "model_config": model_config,
         # sequential offset into train_loader's token stream, so resuming
         # continues from here instead of restarting at the beginning of the data
         "train_loader_position": train_loader.current_position,
         "rng_state": torch.get_rng_state(),
         "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        # running aggregate accumulators as of exactly this step, so resuming
+        # from this checkpoint restores averages in sync with start_step instead
+        # of whatever metrics.json last happened to have on disk (which is
+        # written more often than checkpoints and can be ahead of them)
+        "metrics_stats": tracker.stats(),
     }
 
 
 def main():
     args = parse_args()
+
+    if args.list_attentions:
+        print("registered attention implementations:")
+        for name in available_attentions():
+            print(f"  {name}")
+        return
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -121,8 +141,36 @@ def main():
     train_loader = Dataloader(B=Batch, T=Sequence_length, split="train", data_dir=args.data_dir)
     val_loader = Dataloader(B=Batch, T=Sequence_length, split="val", data_dir=args.data_dir)
 
+    # Model config. This is the single place the attention implementation is
+    # chosen; everything downstream (the blocks, the profiler, the checkpoint,
+    # metrics.json) reads it from here instead of importing a concrete class.
+    model_config = ModelConfig()
+    if args.attention is not None:
+        model_config.attention = args.attention
+
+    ckpt = None
+    if resume_path:
+        print(f"resuming from checkpoint: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        # A checkpoint's weights only fit the attention they were trained with,
+        # so adopt the name recorded in it rather than silently rebuilding a
+        # different architecture and failing in load_state_dict.
+        ckpt_attention = getattr(ckpt.get("model_config"), "attention", None)
+        if ckpt_attention is not None and ckpt_attention != model_config.attention:
+            if args.attention is not None:
+                raise SystemExit(
+                    f"--attention {args.attention!r} conflicts with the checkpoint at "
+                    f"{resume_path}, which was trained with {ckpt_attention!r}. Pass "
+                    "--no_resume (or a different --out_dir) to train the new attention "
+                    "from scratch."
+                )
+            print(f"checkpoint was trained with attention={ckpt_attention!r}; using that "
+                  f"instead of the config default {model_config.attention!r}")
+            model_config.attention = ckpt_attention
+
     # Model
-    model = GPT(ModelConfig())
+    model = GPT(model_config)
+    print(f"attention implementation: {model_config.attention}")
     model.to(device)
 
     # Build the optimizer against the un-compiled model (compiling first can prefix
@@ -135,9 +183,8 @@ def main():
 
     start_step = 0
     best_val_loss = float("inf")
-    if resume_path:
-        print(f"resuming from checkpoint: {resume_path}")
-        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+    checkpoint_stats = None
+    if ckpt is not None:
         raw_model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_step = ckpt["step"] + 1
@@ -146,6 +193,11 @@ def main():
         torch.set_rng_state(ckpt["rng_state"])
         if ckpt.get("cuda_rng_state") is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(ckpt["cuda_rng_state"])
+        checkpoint_stats = ckpt.get("metrics_stats")
+        if checkpoint_stats is None:
+            print("checkpoint has no embedded metrics stats (from an older run); "
+                  "resumed aggregate metrics (step time, tokens/sec, peak memory, attention) "
+                  "may double-count steps between this checkpoint and the last metrics.json write")
         print(f"resumed at step {start_step}, best_val_loss so far: {best_val_loss:.4f}")
     else:
         print("no checkpoint found (or --no_resume set); starting from scratch")
@@ -160,7 +212,6 @@ def main():
     if use_compile:
         model = torch.compile(model)
 
-    model_config = ModelConfig()
     tracker_kwargs = dict(
         path=args.metrics_path,
         run_info={
@@ -170,6 +221,7 @@ def main():
             "autocast_dtype": str(ptdtype),
             "torch_compile": use_compile,
             "attention_profiling": args.profile_attn,
+            "attention": model_config.attention,
             "seed": args.seed,
             "num_parameters": sum(p.numel() for p in raw_model.parameters()),
             "num_parameters_non_embedding": sum(
@@ -193,11 +245,15 @@ def main():
         device_type=device_type,
     )
     if resume_path:
-        tracker = MetricsTracker.resume(start_step=start_step, **tracker_kwargs)
+        tracker = MetricsTracker.resume(
+            start_step=start_step, checkpoint_stats=checkpoint_stats, **tracker_kwargs
+        )
     else:
         tracker = MetricsTracker(**tracker_kwargs)
     if args.profile_attn:
-        tracker.attach_attention_profiler(raw_model, Attention)
+        # hooks every BaseAttention subclass, so a swapped-in implementation is
+        # profiled without touching this line
+        tracker.attach_attention_profiler(raw_model, BaseAttention)
     print(f"writing metrics to {os.path.abspath(args.metrics_path)}")
 
     # holds the most recently computed validation loss, so the periodic "latest"
@@ -211,15 +267,33 @@ def main():
 
         if step % args.eval_interval == 0 or last_step:
             val_loss = estimate_loss(model, val_loader, args.eval_iters, device, device_type, ptdtype)
-            val_ppl = math.exp(val_loss) if val_loss < 20 else float("inf")
+            val_ppl = safe_exp(val_loss)
             tracker.log_validation(step, val_loss)
             tracker.write()
             print(f"step {step}: val_loss {val_loss:.4f} | val_ppl {val_ppl:.2f}")
+
+            agg = tracker.aggregates()
+            if agg["measured_steps"]:
+                attn = agg.get("attention") or {}
+                peak_mib = agg.get("avg_peak_memory_mib") or {}
+                line = (
+                    f"  avg tok/sec: {agg['avg_tokens_per_sec']:.2f}"
+                    f" | avg step time: {agg['avg_step_time_ms']:.2f}ms"
+                )
+                if agg.get("avg_model_time_ms") is not None:
+                    line += f" | model time: {agg['avg_model_time_ms']:.2f}ms"
+                if attn.get("avg_time_ms") is not None:
+                    line += f" | attn time: {attn['avg_time_ms']:.2f}ms"
+                if peak_mib.get("allocated") is not None:
+                    line += f" | avg peak mem: {peak_mib['allocated']:.1f} MiB"
+                print(line)
+
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_ckpt_path = os.path.join(args.out_dir, "ckpt_best.pt")
                 torch.save(
-                    build_checkpoint(raw_model, optimizer, step, val_loss, best_val_loss, train_loader),
+                    build_checkpoint(raw_model, optimizer, step, val_loss, best_val_loss, train_loader,
+                                     tracker, model_config),
                     best_ckpt_path,
                 )
                 print(f"saved best checkpoint to {best_ckpt_path}")
@@ -265,21 +339,17 @@ def main():
 
         train_loss = loss_accum.item() / grad_accumulation_steps
         # end_step does the single per-step cuda synchronize and resolves the timers
-        dt, tokens_per_sec, phases = tracker.end_step(
-            step, loss=train_loss, lr=step_lr, grad_norm=norm.item()
-        )
-        attn_ms = phases.get("attention_forward", 0.0) + phases.get("attention_backward", 0.0)
-        attn_str = f" | attn: {attn_ms:.2f}ms" if args.profile_attn else ""
-        print(
-            f"step {step} | loss: {train_loss:.4f} "
-            f"| lr: {step_lr:.2e} | norm: {norm.item():.2f} "
-            f"| tok/sec: {tokens_per_sec:.2f} | time: {dt:.2f}ms{attn_str}"
-        )
+        tracker.end_step(step, loss=train_loss, lr=step_lr, grad_norm=norm.item())
+
+        if step % args.log_interval == 0 or last_step:
+            train_ppl = safe_exp(train_loss)
+            print(f"step {step}: train_loss {train_loss:.4f} | train_ppl {train_ppl:.2f}")
 
         if step % args.ckpt_interval == 0 or last_step:
             latest_ckpt_path = os.path.join(args.out_dir, "ckpt_latest.pt")
             torch.save(
-                build_checkpoint(raw_model, optimizer, step, val_loss, best_val_loss, train_loader),
+                build_checkpoint(raw_model, optimizer, step, val_loss, best_val_loss, train_loader,
+                                 tracker, model_config),
                 latest_ckpt_path,
             )
             print(f"saved latest checkpoint to {latest_ckpt_path}")

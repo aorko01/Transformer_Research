@@ -4,12 +4,14 @@ Metrics collection for training runs, serialised to `metrics.json`.
 Two kinds of numbers are recorded, because they answer different questions:
 
 * **Curves** - train loss / val loss / val perplexity, appended every N steps.
-  These are per-step time series and are meant to be plotted.
-* **Aggregates** - step time, tokens/sec, peak memory, and the time+memory spent
-  inside the attention layers. A single training step is noisy (allocator warm-up,
-  cuDNN autotuning, `torch.compile` recompiles), so the first
-  `warmup_steps_skipped` steps are thrown away and everything after that is
-  summarised as mean/std/median/min/max/p90 rather than stored per step.
+  These are per-step time series and are meant to be plotted. Train points are
+  appended every `log_interval` steps, val points every `eval_interval` steps.
+* **Aggregates** - running averages of step time, tokens/sec, peak memory, and
+  the time spent inside the model (forward+backward) vs. specifically inside
+  the attention layers. These are kept as running sum/count accumulators
+  rather than per-step sample lists, so `metrics.json` stays small no matter
+  how long a run goes. The first q`warmup_steps_skipped` steps are excluded
+  (allocator warm-up, cuDNN autotuning, `torch.compile` recompiles are noisy).
 
 Timing on CUDA uses CUDA events instead of `time.perf_counter()`: kernel launches
 are asynchronous, so a host-side timer around a launch measures the launch, not
@@ -17,14 +19,13 @@ the work. Events are recorded in-stream and resolved once per step after a singl
 `torch.cuda.synchronize()`, which keeps the instrumentation off the critical path.
 
 `MetricsTracker.resume()` lets a restarted training run continue the same
-`metrics.json` (curves + aggregate samples) instead of starting a fresh report -
+`metrics.json` (curves + running aggregates) instead of starting a fresh report -
 see its docstring below.
 """
 
 import json
 import math
 import os
-import statistics
 import time
 from datetime import datetime, timezone
 
@@ -33,40 +34,32 @@ import torch
 MIB = 1024 ** 2
 
 
-def _trim_by_step(values, steps, start_step):
-    """
-    Keep only the samples in `values` whose parallel `steps` entry is before
-    `start_step`. Used by `MetricsTracker.resume()` so raw samples for steps
-    that get re-measured after a crash/restart aren't double-counted in the
-    aggregates. Falls back to keeping everything unfiltered if `steps` is
-    missing or mismatched in length (e.g. an older metrics.json written before
-    step-tagging was added) - better to slightly overcount than silently drop
-    real samples.
-    """
-    if not steps or len(steps) != len(values):
-        return list(values), list(steps)
-    kept = [(v, s) for v, s in zip(values, steps) if s < start_step]
-    if not kept:
-        return [], []
-    vals, kept_steps = zip(*kept)
-    return list(vals), list(kept_steps)
+class _RunningStat:
+    """A mean, kept as a running sum/count instead of a stored sample list."""
 
+    __slots__ = ("count", "sum")
 
-def _summarize(values):
-    """mean/std/median/min/max/p90 for a list of samples (None if empty)."""
-    if not values:
-        return None
-    vals = sorted(values)
-    n = len(vals)
-    return {
-        "count": n,
-        "mean": sum(vals) / n,
-        "std": statistics.stdev(vals) if n > 1 else 0.0,
-        "median": statistics.median(vals),
-        "min": vals[0],
-        "max": vals[-1],
-        "p90": vals[min(n - 1, int(round(0.9 * (n - 1))))],
-    }
+    def __init__(self):
+        self.count = 0
+        self.sum = 0.0
+
+    def add(self, value):
+        self.count += 1
+        self.sum += value
+
+    @property
+    def mean(self):
+        return self.sum / self.count if self.count else None
+
+    def to_dict(self):
+        return {"count": self.count, "sum": self.sum}
+
+    @classmethod
+    def from_dict(cls, data):
+        stat = cls()
+        stat.count = data.get("count", 0)
+        stat.sum = data.get("sum", 0.0)
+        return stat
 
 
 class _Timer:
@@ -169,8 +162,6 @@ class AttentionProfiler:
                 module.register_full_backward_hook(self._backward_post)
 
     def reset_step(self):
-        self.forward_calls = 0
-        self.backward_calls = 0
         self.peak_absolute = 0
         self.peak_delta = 0
 
@@ -203,7 +194,6 @@ class AttentionProfiler:
             return
         self.timer.stop("attention_forward")
         self._close_segment()
-        self.forward_calls += 1
 
     def _backward_pre(self, module, grad_output):
         if not self.enabled:
@@ -216,12 +206,11 @@ class AttentionProfiler:
             return
         self.timer.stop("attention_backward")
         self._close_segment()
-        self.backward_calls += 1
 
 
 class MetricsTracker:
     """
-    Collects curves + aggregates and writes them to `metrics.json`.
+    Collects curves + running aggregates and writes them to `metrics.json`.
 
     Typical use inside the training loop::
 
@@ -234,7 +223,7 @@ class MetricsTracker:
 
     For a fresh run, construct normally with `MetricsTracker(...)`. For a run
     resumed from a checkpoint, use `MetricsTracker.resume(...)` instead so the
-    new process continues the same curves and aggregate samples rather than
+    new process continues the same curves and running aggregates rather than
     starting `metrics.json` over from nothing.
     """
 
@@ -259,23 +248,20 @@ class MetricsTracker:
         self.train_curve = []
         self.val_curve = []
 
-        # aggregate samples, only collected for steps >= warmup_steps_skipped.
-        # Each sample list has a parallel "*_steps" list recording which global
-        # step it came from, so resume() can trim out steps that get re-measured
-        # after a crash/restart instead of double-counting them.
-        self._step_ms = []
-        self._step_ms_steps = []
-        self._tokens_per_sec = []
-        self._phase_ms = {}
-        self._phase_steps = {}
-        self._attn_forward_ms = []
-        self._attn_backward_ms = []
-        self._attn_steps = []
-        self._step_peak_alloc = []
-        self._step_peak_reserved = []
-        self._peak_steps = []
-        self._attn_peak_absolute = 0
-        self._attn_peak_delta = 0
+        # Running aggregates, only accumulated for steps >= warmup_steps_skipped.
+        # Kept as sum/count rather than per-step lists so metrics.json doesn't
+        # grow with run length.
+        self._step_time = _RunningStat()
+        self._tokens_per_sec = _RunningStat()
+        self._phase_time = {}  # label -> _RunningStat, e.g. "forward"/"backward"
+        self._attn_forward = _RunningStat()
+        self._attn_backward = _RunningStat()
+        self._peak_alloc_avg = _RunningStat()
+        self._peak_reserved_avg = _RunningStat()
+        self._attn_peak_absolute = 0  # running max, not averaged
+        self._attn_peak_delta = 0    # running max, not averaged
+
+        # instantaneous per-step high-water marks, reset every start_step()
         self._peak_alloc = 0
         self._peak_reserved = 0
 
@@ -285,10 +271,10 @@ class MetricsTracker:
 
     @classmethod
     def resume(cls, path, run_info, tokens_per_step, warmup_steps_skipped,
-               log_interval, device_type, start_step=0):
+               log_interval, device_type, start_step=0, checkpoint_stats=None):
         """
         Reconstruct a MetricsTracker from an existing `metrics.json`, so a
-        resumed training run continues the same curves and aggregate samples
+        resumed training run continues the same curves and running aggregates
         instead of starting a fresh report at `start_step`.
 
         Falls back to a normal, empty tracker if `path` doesn't exist yet
@@ -299,7 +285,22 @@ class MetricsTracker:
         checkpoint's `step + 1`). Any prior curve entries at or beyond that
         step are dropped - if the checkpoint being resumed from was saved
         after the last metrics.json flush (or the process crashed between the
-        two), this avoids duplicate/stale entries once training continues.
+        two), this avoids duplicate/stale curve entries.
+
+        The running aggregates (step time, tokens/sec, peak memory, attention
+        time) are cumulative sum/count accumulators, not per-step samples, so
+        they can't be trimmed by step the way the curves are. metrics.json is
+        written more often than checkpoints (every `log_interval`/
+        `eval_interval` steps vs. every `ckpt_interval` steps), so its `_stats`
+        can be ahead of the checkpoint being resumed from; blindly restoring
+        it would re-add the steps between the checkpoint and the crash a
+        second time as the run redoes them. `checkpoint_stats` - the
+        `stats()` snapshot embedded in the checkpoint itself (see `train.py`'s
+        `build_checkpoint`) - is saved atomically with `step`, so it's exactly
+        in sync with `start_step` and is used instead when available. Only
+        checkpoints written before this was added lack it, in which case this
+        falls back to metrics.json's `_stats` and a handful of steps around
+        the crash/restart boundary may be double-counted in the averages.
         """
         tracker = cls(path, run_info, tokens_per_step, warmup_steps_skipped,
                       log_interval, device_type)
@@ -316,6 +317,7 @@ class MetricsTracker:
         prior_run = prior.get("run", {})
         if "started_at" in prior_run:
             tracker.run_info["started_at"] = prior_run["started_at"]
+            tracker._wall_start = datetime.fromisoformat(prior_run["started_at"]).timestamp()
         resumed_at = list(prior_run.get("resumed_at", []))
         resumed_at.append(datetime.now(timezone.utc).isoformat(timespec="seconds"))
         tracker.run_info["resumed_at"] = resumed_at
@@ -323,57 +325,19 @@ class MetricsTracker:
         tracker.train_curve = [row for row in prior.get("train", []) if row["step"] < start_step]
         tracker.val_curve = [row for row in prior.get("val", []) if row["step"] < start_step]
 
-        raw = prior.get("_raw_samples", {})
-
-        # step_ms / tokens_per_sec are always sampled together (same steps)
-        step_ms, step_ms_steps = _trim_by_step(
-            raw.get("step_ms", []), raw.get("step_ms_steps", []), start_step
-        )
-        tokens_per_sec, _ = _trim_by_step(
-            raw.get("tokens_per_sec", []), raw.get("step_ms_steps", []), start_step
-        )
-        tracker._step_ms = step_ms
-        tracker._step_ms_steps = step_ms_steps
-        tracker._tokens_per_sec = tokens_per_sec
-
-        phase_ms = {}
-        phase_steps = {}
-        prior_phase_steps = raw.get("phase_steps", {})
-        for label, values in raw.get("phase_ms", {}).items():
-            trimmed_values, trimmed_steps = _trim_by_step(
-                values, prior_phase_steps.get(label, []), start_step
-            )
-            phase_ms[label] = trimmed_values
-            phase_steps[label] = trimmed_steps
-        tracker._phase_ms = phase_ms
-        tracker._phase_steps = phase_steps
-
-        # step_peak_alloc / step_peak_reserved are always sampled together
-        peak_alloc, peak_steps = _trim_by_step(
-            raw.get("step_peak_alloc", []), raw.get("peak_steps", []), start_step
-        )
-        peak_reserved, _ = _trim_by_step(
-            raw.get("step_peak_reserved", []), raw.get("peak_steps", []), start_step
-        )
-        tracker._step_peak_alloc = peak_alloc
-        tracker._step_peak_reserved = peak_reserved
-        tracker._peak_steps = peak_steps
-
-        # attn_forward_ms / attn_backward_ms are always sampled together
-        attn_forward, attn_steps = _trim_by_step(
-            raw.get("attn_forward_ms", []), raw.get("attn_steps", []), start_step
-        )
-        attn_backward, _ = _trim_by_step(
-            raw.get("attn_backward_ms", []), raw.get("attn_steps", []), start_step
-        )
-        tracker._attn_forward_ms = attn_forward
-        tracker._attn_backward_ms = attn_backward
-        tracker._attn_steps = attn_steps
-
-        # These are running maxima, not summed/averaged samples, so the overlap
-        # window can't double-count them - carry them forward as-is.
-        tracker._attn_peak_absolute = raw.get("attn_peak_absolute", 0)
-        tracker._attn_peak_delta = raw.get("attn_peak_delta", 0)
+        stats = checkpoint_stats if checkpoint_stats is not None else prior.get("_stats", {})
+        tracker._step_time = _RunningStat.from_dict(stats.get("step_time", {}))
+        tracker._tokens_per_sec = _RunningStat.from_dict(stats.get("tokens_per_sec", {}))
+        tracker._phase_time = {
+            label: _RunningStat.from_dict(value)
+            for label, value in stats.get("phase_time", {}).items()
+        }
+        tracker._attn_forward = _RunningStat.from_dict(stats.get("attn_forward", {}))
+        tracker._attn_backward = _RunningStat.from_dict(stats.get("attn_backward", {}))
+        tracker._peak_alloc_avg = _RunningStat.from_dict(stats.get("peak_alloc_avg", {}))
+        tracker._peak_reserved_avg = _RunningStat.from_dict(stats.get("peak_reserved_avg", {}))
+        tracker._attn_peak_absolute = stats.get("attn_peak_absolute", 0)
+        tracker._attn_peak_delta = stats.get("attn_peak_delta", 0)
 
         return tracker
 
@@ -405,7 +369,7 @@ class MetricsTracker:
         self._t0 = time.perf_counter()
 
     def end_step(self, step, loss, lr, grad_norm):
-        """Close out a step: synchronize once, resolve timers, record samples."""
+        """Close out a step: synchronize once, resolve timers, update aggregates."""
         if self.cuda:
             torch.cuda.synchronize()
         step_ms = (time.perf_counter() - self._t0) * 1000.0
@@ -417,20 +381,16 @@ class MetricsTracker:
             self.attention.enabled = False
 
         if self._measuring:
-            self._step_ms.append(step_ms)
-            self._step_ms_steps.append(step)
-            self._tokens_per_sec.append(tokens_per_sec)
+            self._step_time.add(step_ms)
+            self._tokens_per_sec.add(tokens_per_sec)
             for label, value in phases.items():
-                self._phase_ms.setdefault(label, []).append(value)
-                self._phase_steps.setdefault(label, []).append(step)
+                self._phase_time.setdefault(label, _RunningStat()).add(value)
             if self.cuda:
-                self._step_peak_alloc.append(self._peak_alloc)
-                self._step_peak_reserved.append(self._peak_reserved)
-                self._peak_steps.append(step)
+                self._peak_alloc_avg.add(self._peak_alloc)
+                self._peak_reserved_avg.add(self._peak_reserved)
             if self.attention is not None:
-                self._attn_forward_ms.append(phases.get("attention_forward", 0.0))
-                self._attn_backward_ms.append(phases.get("attention_backward", 0.0))
-                self._attn_steps.append(step)
+                self._attn_forward.add(phases.get("attention_forward", 0.0))
+                self._attn_backward.add(phases.get("attention_backward", 0.0))
                 self._attn_peak_absolute = max(self._attn_peak_absolute, self.attention.peak_absolute)
                 self._attn_peak_delta = max(self._attn_peak_delta, self.attention.peak_delta)
 
@@ -438,7 +398,7 @@ class MetricsTracker:
             self.train_curve.append({
                 "step": step,
                 "train_loss": loss,
-                "train_perplexity": _safe_exp(loss),
+                "train_perplexity": safe_exp(loss),
                 "lr": lr,
                 "grad_norm": grad_norm,
                 "step_time_ms": step_ms,
@@ -455,90 +415,79 @@ class MetricsTracker:
         self.val_curve.append({
             "step": step,
             "val_loss": val_loss,
-            "val_perplexity": _safe_exp(val_loss),
+            "val_perplexity": safe_exp(val_loss),
             "tokens_seen": step * self.tokens_per_step,
         })
 
     # --- output ---------------------------------------------------------------------
     def aggregates(self):
+        forward = self._phase_time.get("forward")
+        backward = self._phase_time.get("backward")
+        model_time_ms = None
+        if forward and backward and forward.count and backward.count:
+            model_time_ms = forward.mean + backward.mean
+
         out = {
-            "measured_steps": len(self._step_ms),
+            "measured_steps": self._step_time.count,
             "note": (
                 f"the first {self.warmup_steps_skipped} steps are excluded; "
-                "times are per optimizer step (all gradient-accumulation micro-steps); "
-                "spans every resumed process sharing this metrics.json, not just the current one"
+                "these are running averages per optimizer step (all gradient-accumulation "
+                "micro-steps), accumulated across every resumed process sharing this metrics.json"
             ),
-            "step_time_ms": _summarize(self._step_ms),
-            "tokens_per_sec": _summarize(self._tokens_per_sec),
-            "phase_time_ms": {k: _summarize(v) for k, v in sorted(self._phase_ms.items())},
-            "phase_time_note": (
-                "data/forward/backward/optimizer partition the step; attention_forward "
-                "and attention_backward are nested inside forward/backward, not additional to them"
-            ),
+            "avg_step_time_ms": self._step_time.mean,
+            "avg_tokens_per_sec": self._tokens_per_sec.mean,
+            "avg_model_time_ms": model_time_ms,
         }
 
         if self.cuda:
-            out["peak_memory_per_step_bytes"] = {
-                "allocated": _summarize(self._step_peak_alloc),
-                "reserved": _summarize(self._step_peak_reserved),
-            }
-            out["peak_memory_mib"] = {
-                "allocated": max(self._step_peak_alloc, default=0) / MIB,
-                "reserved": max(self._step_peak_reserved, default=0) / MIB,
+            out["avg_peak_memory_mib"] = {
+                "allocated": (
+                    self._peak_alloc_avg.mean / MIB if self._peak_alloc_avg.mean is not None else None
+                ),
+                "reserved": (
+                    self._peak_reserved_avg.mean / MIB if self._peak_reserved_avg.mean is not None else None
+                ),
             }
 
-        if self.attention is not None and self._step_ms:
-            fwd = _summarize(self._attn_forward_ms)
-            bwd = _summarize(self._attn_backward_ms)
-            total = [f + b for f, b in zip(self._attn_forward_ms, self._attn_backward_ms)]
-            total_summary = _summarize(total)
-            step_mean = out["step_time_ms"]["mean"] if out["step_time_ms"] else None
+        if self.attention is not None:
+            attn_time_ms = None
+            if self._attn_forward.count:
+                attn_time_ms = self._attn_forward.mean + self._attn_backward.mean
             attention = {
                 "layers": self.attention.layers,
-                "forward_ms_per_step": fwd,
-                "backward_ms_per_step": bwd,
-                "total_ms_per_step": total_summary,
+                "avg_time_ms": attn_time_ms,
                 "fraction_of_step_time": (
-                    total_summary["mean"] / step_mean if step_mean else None
+                    attn_time_ms / self._step_time.mean
+                    if attn_time_ms is not None and self._step_time.mean else None
                 ),
             }
             if self.cuda:
-                attention["peak_memory_bytes"] = {
-                    "absolute": self._attn_peak_absolute,
-                    "delta_over_entry": self._attn_peak_delta,
-                }
                 attention["peak_memory_mib"] = {
                     "absolute": self._attn_peak_absolute / MIB,
                     "delta_over_entry": self._attn_peak_delta / MIB,
                 }
-                attention["peak_memory_note"] = (
-                    "'absolute' is the process high-water mark while inside an attention "
-                    "layer (includes activations held by earlier layers); "
-                    "'delta_over_entry' subtracts what was already allocated on entry and "
-                    "is the memory attributable to attention itself"
-                )
             out["attention"] = attention
 
         return out
 
-    def _raw_samples(self):
+    def stats(self):
         """
-        The per-step sample lists that `aggregates()` is computed from. Persisted
-        alongside the curves so `resume()` can reconstruct exact aggregates across
-        a restart instead of only aggregating the current process's steps.
+        The running sum/count accumulators that `aggregates()` computes means
+        from. Persisted alongside the curves (as a handful of numbers, not
+        per-step samples) so `resume()` can carry the averages forward across
+        a restart. Also embedded in checkpoints (see `train.py`'s
+        `build_checkpoint`) so a resume can restore the aggregates exactly as
+        of the checkpointed step, instead of whatever metrics.json last
+        happened to have on disk.
         """
         return {
-            "step_ms": self._step_ms,
-            "step_ms_steps": self._step_ms_steps,
-            "tokens_per_sec": self._tokens_per_sec,
-            "phase_ms": self._phase_ms,
-            "phase_steps": self._phase_steps,
-            "step_peak_alloc": self._step_peak_alloc,
-            "step_peak_reserved": self._step_peak_reserved,
-            "peak_steps": self._peak_steps,
-            "attn_forward_ms": self._attn_forward_ms,
-            "attn_backward_ms": self._attn_backward_ms,
-            "attn_steps": self._attn_steps,
+            "step_time": self._step_time.to_dict(),
+            "tokens_per_sec": self._tokens_per_sec.to_dict(),
+            "phase_time": {k: v.to_dict() for k, v in self._phase_time.items()},
+            "attn_forward": self._attn_forward.to_dict(),
+            "attn_backward": self._attn_backward.to_dict(),
+            "peak_alloc_avg": self._peak_alloc_avg.to_dict(),
+            "peak_reserved_avg": self._peak_reserved_avg.to_dict(),
             "attn_peak_absolute": self._attn_peak_absolute,
             "attn_peak_delta": self._attn_peak_delta,
         }
@@ -549,7 +498,7 @@ class MetricsTracker:
             "aggregates": self.aggregates(),
             "train": self.train_curve,
             "val": self.val_curve,
-            "_raw_samples": self._raw_samples(),
+            "_stats": self.stats(),
         }
 
     def write(self, status="running"):
@@ -567,7 +516,7 @@ class MetricsTracker:
         os.replace(tmp_path, self.path)
 
 
-def _safe_exp(loss):
+def safe_exp(loss):
     """exp(loss), guarding against overflow on an early/diverged run."""
     try:
         return math.exp(loss)
