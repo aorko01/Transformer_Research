@@ -23,7 +23,7 @@ class TrainingConfig:
     lr: float = 6e-4
     min_lr: float = 6e-5          # cosine decay floor
     warmup_steps: int = 500       # linear warmup steps before cosine decay kicks in
-    Batch: int = 8
+    Batch: int = 4
     Sequence_length: int = 1024
     Total_batches: int = 524288   # target tokens per optimizer step (drives grad accumulation)
     eval_interval: int = 200      # run validation every N steps
