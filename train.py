@@ -190,9 +190,24 @@ def main():
         start_step = ckpt["step"] + 1
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
         train_loader.current_position = ckpt.get("train_loader_position", 0)
-        torch.set_rng_state(ckpt["rng_state"])
+
+        # Restore RNG state if available and valid
+        rng_state = ckpt.get("rng_state")
+        if rng_state is not None:
+            try:
+                if isinstance(rng_state, torch.Tensor) and rng_state.dtype == torch.uint8:
+                    torch.set_rng_state(rng_state)
+                else:
+                    print(f"warning: checkpoint RNG state has unexpected format (dtype={getattr(rng_state, 'dtype', 'N/A')}); skipping RNG restoration")
+            except Exception as e:
+                print(f"warning: failed to restore RNG state: {e}; continuing with fresh RNG")
+
         if ckpt.get("cuda_rng_state") is not None and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all(ckpt["cuda_rng_state"])
+            try:
+                torch.cuda.set_rng_state_all(ckpt["cuda_rng_state"])
+            except Exception as e:
+                print(f"warning: failed to restore CUDA RNG state: {e}; continuing with fresh CUDA RNG")
+
         checkpoint_stats = ckpt.get("metrics_stats")
         if checkpoint_stats is None:
             print("checkpoint has no embedded metrics stats (from an older run); "
