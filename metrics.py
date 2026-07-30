@@ -279,7 +279,7 @@ class MetricsTracker:
 
         Falls back to a normal, empty tracker if `path` doesn't exist yet
         (e.g. resuming a checkpoint from a run that never got far enough to
-        write metrics).
+        write metrics), or if it exists but can't be parsed.
 
         `start_step` is the step the resumed run will begin at (i.e. the
         checkpoint's `step + 1`). Any prior curve entries at or beyond that
@@ -308,8 +308,29 @@ class MetricsTracker:
         if not os.path.exists(path):
             return tracker
 
-        with open(path) as handle:
-            prior = json.load(handle)
+        try:
+            with open(path) as handle:
+                prior = json.load(handle)
+            if not isinstance(prior, dict):
+                raise ValueError(f"expected a JSON object, got {type(prior).__name__}")
+        except (OSError, ValueError) as e:
+            # write() is atomic (tmp file + os.replace), so a torn report should
+            # be unreachable - but a disk error or a bad copy between machines
+            # can still leave one unparseable, and losing the old curves must
+            # not take down the training run itself (which, under an
+            # auto-restarting supervisor, would crash-loop it). Continue with a
+            # fresh report; the checkpoint still carries the running aggregates,
+            # so only the historical curve points are lost. The unreadable file
+            # is kept aside rather than silently overwritten by the first write.
+            print(f"warning: existing metrics at {path} are unreadable ({e}); "
+                  "starting a fresh report for this run")
+            try:
+                os.replace(path, path + ".corrupt")
+                print(f"moved the unreadable report aside to {path}.corrupt")
+            except OSError as move_error:
+                print(f"warning: could not preserve it ({move_error}); "
+                      "it will be overwritten on the next write")
+            return tracker
 
         # Keep the original run's start time so elapsed_wall_clock_sec spans
         # the whole job rather than resetting on every restart; keep a

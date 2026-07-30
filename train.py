@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 
 import torch
@@ -77,11 +78,20 @@ def parse_args():
 
 
 def build_checkpoint(raw_model, optimizer, step, val_loss, best_val_loss, train_loader, tracker,
-                     model_config, training_args):
+                     model_config, training_args, next_step):
     return {
         "model": raw_model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "step": step,
+        # The step to resume *at*, which is not always step+1: ckpt_best.pt is
+        # written from the eval block at the top of the loop body, before step
+        # `step` has trained, so it resumes at `step` itself; ckpt_latest.pt is
+        # written at the end of the body, after the optimizer update, so it
+        # resumes at step+1. Everything else captured here (weights, optimizer
+        # state, train_loader_position, metrics_stats) is "as of" next_step, so
+        # inferring it as step+1 for both would silently skip a whole optimizer
+        # step and shift the data stream against the step counter.
+        "next_step": next_step,
         "val_loss": val_loss,
         "best_val_loss": best_val_loss,
         # the config the weights were actually built from, so a resume can tell
@@ -182,13 +192,30 @@ def main():
         # step, instead of always preferring ckpt_latest.pt and silently losing
         # progress.
         candidates = [p for p in (latest_ckpt_path, best_ckpt_path) if os.path.exists(p)]
-        if len(candidates) == 1:
-            resume_path = candidates[0]
-        elif len(candidates) == 2:
-            steps = {p: torch.load(p, map_location="cpu", weights_only=False)["step"] for p in candidates}
+        steps = {}
+        for p in candidates:
+            try:
+                probe = torch.load(p, map_location="cpu", weights_only=False)
+                # compare on the step each would *resume at*, not the step it
+                # records: the two files disagree on what `step` means (see
+                # build_checkpoint's next_step comment)
+                steps[p] = probe.get("next_step", probe["step"] + 1)
+                # this pulled a whole checkpoint into RAM to read one integer;
+                # drop it before probing the next candidate rather than holding
+                # both (and then the last one, for the rest of the run)
+                del probe
+            except Exception as e:
+                # a truncated/corrupt file (bad copy, disk error, kill mid-write
+                # on an older version without atomic saves) must not crash-loop
+                # the whole process under systemd Restart=on-failure - drop it
+                # and fall back to whichever other checkpoint is still readable
+                print(f"warning: checkpoint at {p} is unreadable ({e}); ignoring it")
+        if steps:
             resume_path = max(steps, key=steps.get)
         if resume_path is not None:
             print(f"found existing checkpoint at {resume_path}; resuming automatically")
+        elif candidates:
+            print(f"all checkpoints in {args.out_dir} were unreadable; starting from scratch")
     # ------------------------------------------------------------------------
 
     # Data
@@ -287,16 +314,25 @@ def main():
     if ckpt is not None:
         raw_model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
-        start_step = ckpt["step"] + 1
+        # step+1 is only the right resume point for checkpoints saved after the
+        # optimizer update; next_step records it explicitly (absent on older
+        # checkpoints, which were all ckpt_latest.pt-style saves)
+        start_step = ckpt.get("next_step", ckpt["step"] + 1)
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
         train_loader.current_position = ckpt.get("train_loader_position", 0)
 
-        # Restore RNG state if available and valid
+        # Restore RNG state if available and valid. torch.set_rng_state /
+        # torch.cuda.set_rng_state_all both require CPU ByteTensors, but `ckpt`
+        # was loaded with map_location=device, so on a CUDA run these tensors
+        # arrive on the GPU and must be moved back to CPU explicitly - otherwise
+        # set_rng_state raises "RNG state must be a torch.ByteTensor" (the dtype
+        # is still uint8 on GPU, so the format check below doesn't catch it) and
+        # restoration silently no-ops on every CUDA run.
         rng_state = ckpt.get("rng_state")
         if rng_state is not None:
             try:
                 if isinstance(rng_state, torch.Tensor) and rng_state.dtype == torch.uint8:
-                    torch.set_rng_state(rng_state)
+                    torch.set_rng_state(rng_state.cpu())
                 else:
                     print(f"warning: checkpoint RNG state has unexpected format (dtype={getattr(rng_state, 'dtype', 'N/A')}); skipping RNG restoration")
             except Exception as e:
@@ -304,7 +340,7 @@ def main():
 
         if ckpt.get("cuda_rng_state") is not None and torch.cuda.is_available():
             try:
-                torch.cuda.set_rng_state_all(ckpt["cuda_rng_state"])
+                torch.cuda.set_rng_state_all([s.cpu() for s in ckpt["cuda_rng_state"]])
             except Exception as e:
                 print(f"warning: failed to restore CUDA RNG state: {e}; continuing with fresh CUDA RNG")
 
@@ -314,6 +350,18 @@ def main():
                   "resumed aggregate metrics (step time, tokens/sec, peak memory, attention) "
                   "may double-count steps between this checkpoint and the last metrics.json write")
         print(f"resumed at step {start_step}, best_val_loss so far: {best_val_loss:.4f}")
+
+        # Release the checkpoint now that everything has been read out of it.
+        # It was loaded with map_location=device, so every tensor in it is on the
+        # GPU, and load_state_dict *copies* into the model's parameters instead of
+        # aliasing them - so without this the checkpoint's own copy of the weights
+        # (~0.5 GB here) stays resident for the entire run. That leaves a resumed
+        # run with less headroom than the fresh run that produced the checkpoint,
+        # which can turn a restart into an OOM that repeats on every restart.
+        # (The optimizer state genuinely does alias, so this frees only dead memory.)
+        del ckpt
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     else:
         print("no checkpoint found (or --no_resume set); starting from scratch")
 
@@ -375,6 +423,9 @@ def main():
     # checkpoint below always has a value to record even between eval_interval steps
     val_loss = best_val_loss if best_val_loss != float("inf") else float("nan")
 
+    # latches once training blows up to NaN; see the divergence check in the loop
+    diverged = False
+
     model.train()
 
     for step in range(start_step, max_steps):
@@ -407,8 +458,9 @@ def main():
                 best_val_loss = val_loss
                 best_ckpt_path = os.path.join(args.out_dir, "ckpt_best.pt")
                 save_checkpoint_atomic(
+                    # step hasn't trained yet at this point in the loop body
                     build_checkpoint(raw_model, optimizer, step, val_loss, best_val_loss, train_loader,
-                                     tracker, model_config, training_args),
+                                     tracker, model_config, training_args, next_step=step),
                     best_ckpt_path,
                 )
                 print(f"saved best checkpoint to {best_ckpt_path}")
@@ -453,21 +505,53 @@ def main():
         tracker.timer.stop("optimizer")
 
         train_loss = loss_accum.item() / grad_accumulation_steps
+        grad_norm = norm.item()
         # end_step does the single per-step cuda synchronize and resolves the timers
-        tracker.end_step(step, loss=train_loss, lr=step_lr, grad_norm=norm.item())
+        tracker.end_step(step, loss=train_loss, lr=step_lr, grad_norm=grad_norm)
+
+        # Has this step poisoned the weights? Either symptom is enough:
+        #   * non-finite loss  - the forward pass already saw NaN parameters;
+        #   * non-finite grad norm - clip_grad_norm_ scales every gradient by
+        #     max_norm/(total_norm + 1e-6) clamped to 1, which is NaN when the
+        #     norm is NaN and 0 when it is inf (and 0 * inf is NaN again), so
+        #     optimizer.step() has just written NaNs into the parameters even
+        #     though the loss that produced them was still finite.
+        # Checking the loss alone would let exactly one poisoned checkpoint
+        # through, on the step where the gradients blew up but the loss had not
+        # caught up yet.
+        if not diverged and not (math.isfinite(train_loss) and math.isfinite(grad_norm)):
+            # Latch rather than re-test per step: NaN parameters stay NaN, and
+            # latching means a single blow-up can never be "recovered from" into
+            # writing a poisoned checkpoint. Announce it here, at the step it
+            # happens, rather than at the next checkpoint boundary - which with
+            # the default ckpt_interval can be hundreds of steps later.
+            diverged = True
+            print(f"WARNING: step {step} diverged (train_loss={train_loss}, "
+                  f"grad_norm={grad_norm}). The parameters are NaN from here on, so "
+                  f"{latest_ckpt_path} will no longer be updated and the last good "
+                  "checkpoint survives. Stop the run and investigate.")
 
         if step % args.log_interval == 0 or last_step:
             train_ppl = safe_exp(train_loss)
             print(f"step {step}: train_loss {train_loss:.4f} | train_ppl {train_ppl:.2f}")
 
         if step % args.ckpt_interval == 0 or last_step:
-            latest_ckpt_path = os.path.join(args.out_dir, "ckpt_latest.pt")
-            save_checkpoint_atomic(
-                build_checkpoint(raw_model, optimizer, step, val_loss, best_val_loss, train_loader,
-                                 tracker, model_config, training_args),
-                latest_ckpt_path,
-            )
-            print(f"saved latest checkpoint to {latest_ckpt_path}")
+            # Overwriting ckpt_latest.pt with diverged weights would destroy the
+            # last good resume point, and every later restart would faithfully
+            # reload the garbage. Keep the previous file instead, so the run can
+            # be resumed from before the blow-up. ckpt_best.pt is already safe:
+            # `val_loss < best_val_loss` is False for NaN, so it is never
+            # overwritten by a diverged eval.
+            if diverged:
+                print(f"step {step}: diverged, leaving {latest_ckpt_path} untouched")
+            else:
+                save_checkpoint_atomic(
+                    # step is fully trained by the time we get here
+                    build_checkpoint(raw_model, optimizer, step, val_loss, best_val_loss, train_loader,
+                                     tracker, model_config, training_args, next_step=step + 1),
+                    latest_ckpt_path,
+                )
+                print(f"saved latest checkpoint to {latest_ckpt_path}")
 
     tracker.write(status="completed")
     print(f"wrote metrics to {os.path.abspath(args.metrics_path)}")
