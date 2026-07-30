@@ -47,7 +47,8 @@ def parse_args():
     parser.add_argument("--resume", type=str, default=None,
                          help="path to a checkpoint to resume from (restores model, optimizer, step, "
                               "dataloader position, and RNG state). If omitted, train.py will "
-                              "automatically resume from <out_dir>/ckpt_latest.pt if that file exists, "
+                              "automatically resume from whichever of <out_dir>/ckpt_latest.pt or "
+                              "<out_dir>/ckpt_best.pt has the higher step, if either file exists, "
                               "otherwise it starts from scratch. Pass --no_resume to force a fresh run "
                               "even if a checkpoint is present.")
     parser.add_argument("--no_resume", action="store_true", default=False,
@@ -167,14 +168,27 @@ def main():
     # overrides this and always starts from scratch, even if a checkpoint
     # file is sitting in out_dir.
     resume_path = args.resume
-    auto_ckpt_path = os.path.join(args.out_dir, "ckpt_latest.pt")
+    latest_ckpt_path = os.path.join(args.out_dir, "ckpt_latest.pt")
+    best_ckpt_path = os.path.join(args.out_dir, "ckpt_best.pt")
     if args.no_resume:
         resume_path = None
-        if os.path.exists(auto_ckpt_path):
-            print(f"--no_resume set: ignoring existing checkpoint at {auto_ckpt_path}")
-    elif resume_path is None and os.path.exists(auto_ckpt_path):
-        resume_path = auto_ckpt_path
-        print(f"found existing checkpoint at {auto_ckpt_path}; resuming automatically")
+        if os.path.exists(latest_ckpt_path) or os.path.exists(best_ckpt_path):
+            print(f"--no_resume set: ignoring existing checkpoints in {args.out_dir}")
+    elif resume_path is None:
+        # ckpt_latest.pt is only written every --ckpt_interval steps, while
+        # ckpt_best.pt is written every --eval_interval steps (whenever val loss
+        # improves), so it can be further along if the process was killed between
+        # two ckpt_interval saves. Resume from whichever actually has the higher
+        # step, instead of always preferring ckpt_latest.pt and silently losing
+        # progress.
+        candidates = [p for p in (latest_ckpt_path, best_ckpt_path) if os.path.exists(p)]
+        if len(candidates) == 1:
+            resume_path = candidates[0]
+        elif len(candidates) == 2:
+            steps = {p: torch.load(p, map_location="cpu", weights_only=False)["step"] for p in candidates}
+            resume_path = max(steps, key=steps.get)
+        if resume_path is not None:
+            print(f"found existing checkpoint at {resume_path}; resuming automatically")
     # ------------------------------------------------------------------------
 
     # Data

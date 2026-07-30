@@ -19,13 +19,13 @@ square.
   3. **Global.** That (G, L) matrix is treated as a sequence of G tokens with L
      features and self-attended causally: `glob = softmax(M M^T / sqrt(L))`,
      shape (G, G). No new projections - the summaries are their own Q and K.
-  4. **Combine.** Output block i is built by scaling every local map by that
-     block's row of the global map and applying the result to V:
+  4. **Combine.** Own-block output is always included in full (weight 1, no
+     softmax competition); *other* blocks are mixed in strictly by block index,
+     scaled by that block's row of the global map:
 
-         out[i] = sum_j glob[i, j] * (local[j] @ V[j])
+         out[i] = local[i] @ V[i]  +  sum_{j<i} glob[i, j] * (local[j] @ V[j])
 
-     which is the `localscaled[j] = local[j] * glob[i][j]` construction, folded
-     so the (G, G, L, L) stack of scaled maps is never a real tensor.
+     folded so the (G, G, L, L) stack of scaled maps is never a real tensor.
 
 V is untouched until the very last step, exactly as in the vanilla path.
 
@@ -41,12 +41,19 @@ fly. Nothing of size (G, G, L, L) is ever allocated in either direction.
 Causality
 ---------
 Token (i, l) reads block j<i in full and its own block up to position l, so the
-value path is strictly causal. Note that the *weights* are not: `glob[i, :]`
-comes from the summary of block i, which sums over every query in that block,
-so positions later in the same block influence how earlier ones mix the past.
-The leak is bounded by the block (L-1 = 31 tokens at T=1024) and is inherent to
-summarising a block before attending with it; shifting the global attention to
-strictly past blocks (`j < i`) would remove it.
+value path is strictly causal.
+
+An earlier version let block i attend to itself at the global level too
+(`j <= i`), which leaked future tokens into the past: `glob[i, :]` is derived
+from `summary[i]`, which sums over *every* query in block i (including queries
+after position l), and that same glob row was then used to weight the block's
+own local output for every position l in the block - so how much an early
+token in the block "trusted" its own local attention depended on what later
+tokens in that block did. The global softmax now only ever ranges over
+strictly earlier blocks (`j < i`); the own-block contribution is added outside
+that softmax with a fixed weight of 1, so it can no longer be modulated by a
+future-influenced weight. Block 0 has no `j < 0`, so its global row is all
+zero and its output is exactly `local[0] @ V[0]`.
 """
 
 import math
@@ -74,7 +81,13 @@ def block_geometry(T):
 
 class _ScaledBlockCombine(torch.autograd.Function):
     """
-    out[b,h,i,l,:] = sum_j glob[b,h,i,j] * (local[b,h,j,l,:] @ V[b,h,j])
+    out[b,h,i,l,:] = P[b,h,i,l,:] + sum_{j<i} glob[b,h,i,j] * P[b,h,j,l,:]
+    where P[b,h,j] = local[b,h,j] @ V[b,h,j].
+
+    The own-block term is added with a fixed weight of 1, outside the glob
+    softmax (glob's diagonal is always 0 - see the module docstring's
+    Causality section for why). `glob` is expected to already be masked to
+    strictly j < i (row 0 all zero).
 
     Written by hand rather than left to autograd so that the intermediate
     per-output-block scaled maps (`local[j] * glob[i][j]`, a (G, G, L, L) object)
@@ -92,8 +105,8 @@ class _ScaledBlockCombine(torch.autograd.Function):
         # is what keeps the scaled maps virtual.
         P = torch.matmul(local, V)
         B, H, G, L, d = P.shape
-        out = torch.matmul(glob, P.reshape(B, H, G, L * d))
-        return out.view(B, H, G, L, d)
+        mixed = torch.matmul(glob, P.reshape(B, H, G, L * d)).view(B, H, G, L, d)
+        return P + mixed
 
     @staticmethod
     def backward(ctx, grad_out):
@@ -110,8 +123,10 @@ class _ScaledBlockCombine(torch.autograd.Function):
             d_glob = torch.matmul(grad_flat, P.transpose(-2, -1))
 
         if ctx.needs_input_grad[0] or ctx.needs_input_grad[2]:
-            # gradient w.r.t. P, i.e. the scaled maps summed back down per block
-            dP = torch.matmul(glob.transpose(-2, -1), grad_flat).view(B, H, G, L, d)
+            # gradient w.r.t. P: the direct residual term contributes grad_out
+            # itself, and the mixed term contributes glob^T @ grad_out, same as
+            # the plain glob@P case
+            dP = grad_out + torch.matmul(glob.transpose(-2, -1), grad_flat).view(B, H, G, L, d)
             if ctx.needs_input_grad[0]:
                 d_local = torch.matmul(dP, V.transpose(-2, -1))
             if ctx.needs_input_grad[2]:
@@ -137,14 +152,23 @@ class CustomAttention(BaseAttention):
         self.n_head = config.n_head
         self.block_size = config.block_size
 
-        # One triangular mask serves both levels: the local maps slice [:L, :L]
-        # and the global map slices [:G, :G]. Both G and L equal
-        # sqrt(block_size), so this is 32x32 for a 1024-token context.
+        # One triangular mask serves the local level: the local maps slice
+        # [:L, :L] and need query l to see keys 0..l inclusive (ordinary
+        # causal). Both G and L equal sqrt(block_size), so this is 32x32 for a
+        # 1024-token context.
         G_max, L_max = block_geometry(config.block_size)
         span = max(G_max, L_max)
         self.register_buffer(
             "causal_mask",
             torch.tril(torch.ones(span, span, dtype=torch.bool)),
+            persistent=False,
+        )
+        # The global level uses a *strict* lower-triangular mask instead: block
+        # i must not attend to itself here (see the Causality section above),
+        # only to strictly earlier blocks j < i.
+        self.register_buffer(
+            "causal_mask_strict",
+            torch.tril(torch.ones(span, span, dtype=torch.bool), diagonal=-1),
             persistent=False,
         )
 
@@ -179,10 +203,14 @@ class CustomAttention(BaseAttention):
         summary = local.sum(dim=-2)  # (Batch, n_head, G, L)
 
         # --- 3. attention between the blocks themselves -----------------------
+        # strictly j < i: block i's own contribution is added back outside this
+        # softmax (see forward's combine step and the Causality docstring section)
         #! might need to fix the scaling factor here
         global_scores = torch.matmul(summary, summary.transpose(-2, -1)) * (1.0 / math.sqrt(L))
-        global_scores = global_scores.masked_fill(~self.causal_mask[:G, :G], float("-inf"))
+        global_scores = global_scores.masked_fill(~self.causal_mask_strict[:G, :G], float("-inf"))
         glob = F.softmax(global_scores, dim=-1)  # (Batch, n_head, G, G)
+        # block 0 has no j < 0: its row is all -inf, softmax gives NaN, zero it out
+        glob = torch.nan_to_num(glob, nan=0.0)
 
         local = self.attn_dropout(local)
         glob = self.attn_dropout(glob)
