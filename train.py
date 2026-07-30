@@ -52,18 +52,31 @@ def parse_args():
                               "even if a checkpoint is present.")
     parser.add_argument("--no_resume", action="store_true", default=False,
                          help="ignore any existing checkpoint in out_dir and start from scratch")
+    parser.add_argument("--force_resume", action="store_true", default=False,
+                         help="resume even if --lr/--batch_size/--seq_len/--total_batches differ "
+                              "from the values recorded in the checkpoint (these changes silently "
+                              "alter the LR schedule, effective batch size, and data stride "
+                              "mid-run, so they're rejected by default). --max_steps is exempt "
+                              "since extending training length across a resume is a normal thing "
+                              "to do; a mismatch there is only a warning.")
     parser.add_argument("--attention", type=str, default=None,
                          help="which attention implementation to train with (default: "
                               f"{ModelConfig.attention!r}). Registered names are discovered from "
                               "the model/ package; an out-of-package implementation can be given "
                               "as 'package.module:ClassName'. See --list_attentions.")
+    parser.add_argument("--run_name", type=str, default=None,
+                         help="identifies this experiment; namespaces out_dir/metrics_path as "
+                              "<out_dir>/<run_name> so different experiments never share "
+                              "checkpoints or metrics.json by accident. Defaults to the attention "
+                              "implementation name. Only applied when --out_dir/--metrics_path are "
+                              "left at their defaults; explicit values are always respected as-is.")
     parser.add_argument("--list_attentions", action="store_true", default=False,
                          help="print the attention implementations registered in model/ and exit")
     return parser.parse_args()
 
 
 def build_checkpoint(raw_model, optimizer, step, val_loss, best_val_loss, train_loader, tracker,
-                     model_config):
+                     model_config, training_args):
     return {
         "model": raw_model.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -73,6 +86,11 @@ def build_checkpoint(raw_model, optimizer, step, val_loss, best_val_loss, train_
         # the config the weights were actually built from, so a resume can tell
         # which attention implementation this state_dict belongs to
         "model_config": model_config,
+        # lr/batch_size/seq_len/total_batches/max_steps as of this checkpoint, so a
+        # resume can detect a changed flag (e.g. a stale auto-restart script) instead
+        # of silently continuing with a different LR schedule, effective batch size,
+        # or data stride
+        "training_args": training_args,
         # sequential offset into train_loader's token stream, so resuming
         # continues from here instead of restarting at the beginning of the data
         "train_loader_position": train_loader.current_position,
@@ -84,6 +102,15 @@ def build_checkpoint(raw_model, optimizer, step, val_loss, best_val_loss, train_
         # written more often than checkpoints and can be ahead of them)
         "metrics_stats": tracker.stats(),
     }
+
+
+def save_checkpoint_atomic(payload, path):
+    """Write a checkpoint via tmp-file + os.replace, so a kill mid-write (OOM,
+    preemption, power loss) can never leave a half-written file at `path` for
+    auto-resume to load and crash on. Same pattern as metrics.py's write()."""
+    tmp_path = path + ".tmp"
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path)
 
 
 def main():
@@ -118,6 +145,19 @@ def main():
     ptdtype = torch.bfloat16 if use_bf16 else torch.float32
     print(f"using device: {device} | autocast dtype: {ptdtype}")
 
+    # Namespace this run's artifacts (out_dir, metrics_path) by experiment identity
+    # -- the attention implementation, or --run_name if given -- so that training
+    # two different experiments never silently overwrites one run's checkpoints
+    # and metrics.json with another's. Only kicks in when the user left
+    # --out_dir/--metrics_path at their defaults; explicit values win as-is.
+    attention_name = args.attention if args.attention is not None else ModelConfig.attention
+    run_name = args.run_name or attention_name
+    if args.out_dir == TrainingConfig.out_dir:
+        args.out_dir = os.path.join(args.out_dir, run_name)
+    if args.metrics_path == TrainingConfig.metrics_path:
+        args.metrics_path = os.path.join(args.out_dir, TrainingConfig.metrics_path)
+    print(f"run_name: {run_name} | out_dir: {args.out_dir} | metrics_path: {args.metrics_path}")
+
     os.makedirs(args.out_dir, exist_ok=True)
 
     # --- Auto-resume logic -------------------------------------------------
@@ -148,6 +188,18 @@ def main():
     if args.attention is not None:
         model_config.attention = args.attention
 
+    # lr/batch_size/seq_len/total_batches/max_steps as of this run, embedded in every
+    # checkpoint and checked against on resume (see below) so a stale flag in a
+    # restart script can't silently change the LR schedule / effective batch size /
+    # data stride mid-run.
+    training_args = {
+        "lr": lr,
+        "max_steps": max_steps,
+        "batch_size": Batch,
+        "seq_len": Sequence_length,
+        "total_batches": Total_batches,
+    }
+
     ckpt = None
     if resume_path:
         print(f"resuming from checkpoint: {resume_path}")
@@ -167,6 +219,40 @@ def main():
             print(f"checkpoint was trained with attention={ckpt_attention!r}; using that "
                   f"instead of the config default {model_config.attention!r}")
             model_config.attention = ckpt_attention
+
+        # Detect drifted hyperparameters (e.g. a stale flag in a restart script).
+        # max_steps is exempt from the hard fail: resuming to train longer than
+        # originally planned is a normal thing to do, so it's only a warning.
+        ckpt_training_args = ckpt.get("training_args")
+        if ckpt_training_args is not None:
+            hard_checked = ("lr", "batch_size", "seq_len", "total_batches")
+            hard_mismatches = {
+                k: (ckpt_training_args[k], training_args[k]) for k in hard_checked
+                if k in ckpt_training_args and ckpt_training_args[k] != training_args[k]
+            }
+            if hard_mismatches and not args.force_resume:
+                detail = "; ".join(f"{k}: checkpoint={old!r} vs this run={new!r}"
+                                    for k, (old, new) in hard_mismatches.items())
+                raise SystemExit(
+                    f"resume hyperparameter mismatch ({detail}). Continuing would "
+                    "silently change the LR schedule, effective batch size, or data "
+                    "stride mid-run. Fix the flags to match the checkpoint, or pass "
+                    "--force_resume if the change is intentional."
+                )
+            if hard_mismatches:
+                detail = "; ".join(f"{k}: checkpoint={old!r} vs this run={new!r}"
+                                    for k, (old, new) in hard_mismatches.items())
+                print(f"warning: resume hyperparameter mismatch ({detail}); continuing "
+                      "because --force_resume was passed")
+            if ckpt_training_args.get("max_steps") != training_args["max_steps"]:
+                print(f"note: max_steps changed across resume (checkpoint="
+                      f"{ckpt_training_args.get('max_steps')!r} vs this run="
+                      f"{training_args['max_steps']!r}); the cosine LR schedule will "
+                      "be recomputed against the new max_steps")
+        else:
+            print("checkpoint has no embedded training_args (from an older run); "
+                  "cannot verify lr/batch_size/seq_len/total_batches/max_steps "
+                  "consistency across resume")
 
     # Model
     model = GPT(model_config)
@@ -306,9 +392,9 @@ def main():
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_ckpt_path = os.path.join(args.out_dir, "ckpt_best.pt")
-                torch.save(
+                save_checkpoint_atomic(
                     build_checkpoint(raw_model, optimizer, step, val_loss, best_val_loss, train_loader,
-                                     tracker, model_config),
+                                     tracker, model_config, training_args),
                     best_ckpt_path,
                 )
                 print(f"saved best checkpoint to {best_ckpt_path}")
@@ -362,9 +448,9 @@ def main():
 
         if step % args.ckpt_interval == 0 or last_step:
             latest_ckpt_path = os.path.join(args.out_dir, "ckpt_latest.pt")
-            torch.save(
+            save_checkpoint_atomic(
                 build_checkpoint(raw_model, optimizer, step, val_loss, best_val_loss, train_loader,
-                                 tracker, model_config),
+                                 tracker, model_config, training_args),
                 latest_ckpt_path,
             )
             print(f"saved latest checkpoint to {latest_ckpt_path}")
