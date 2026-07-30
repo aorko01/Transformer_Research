@@ -2,8 +2,9 @@
 Square-root blocked causal attention: local attention inside blocks, one global
 attention *between* blocks, combined without ever building the full T x T map.
 
-The sequence is cut into G blocks of L tokens each, with L = ceil(sqrt(T)), so
-for the usual T=1024 that is 32 blocks of 32 tokens.
+The sequence is cut into G blocks of L tokens each, with L = G = sqrt(T), so
+for the usual T=1024 that is 32 blocks of 32 tokens. T must be a perfect
+square.
 
   1. **Local.** Ordinary causal attention inside each block on its own:
      `local[g] = softmax(Q_g K_g^T / sqrt(head_dim))`, shape (G, L, L). Nothing
@@ -61,13 +62,13 @@ def block_geometry(T):
     """
     (number of blocks, block length) for a sequence of T tokens.
 
-    L = ceil(sqrt(T)) and G = ceil(T / L), so G*L >= T with the smallest
-    possible amount of padding and no block that is entirely padding.
-    T=1024 gives the 32x32 split; T=1000 gives 32 blocks of 32 with 24 padded
-    slots at the end.
+    T must be a perfect square: L = G = sqrt(T). T=1024 is not a perfect
+    square and would raise; T=1089 (33^2) gives a 33x33 split.
     """
-    L = math.isqrt(max(T - 1, 0)) + 1
-    G = (T + L - 1) // L
+    L = math.isqrt(max(T, 0))
+    if L * L != T:
+        raise ValueError(f"sequence length {T} must be a perfect square")
+    G = L
     return G, L
 
 
@@ -137,9 +138,8 @@ class CustomAttention(BaseAttention):
         self.block_size = config.block_size
 
         # One triangular mask serves both levels: the local maps slice [:L, :L]
-        # and the global map slices [:G, :G]. Both G and L are bounded by
-        # ceil(sqrt(block_size)) for any T <= block_size, so this is 32x32 for
-        # the default 1024-token context.
+        # and the global map slices [:G, :G]. Both G and L equal
+        # sqrt(block_size), so this is 32x32 for a 1024-token context.
         G_max, L_max = block_geometry(config.block_size)
         span = max(G_max, L_max)
         self.register_buffer(
@@ -155,39 +155,23 @@ class CustomAttention(BaseAttention):
         )
         head_dim = Embedding // self.n_head
         G, L = block_geometry(Token)
-        padding = G * L - Token
 
         Q = self.Wq(X)
         K = self.Wk(X)
         V = self.Wv(X)
 
-        if padding:
-            # square the sequence off; the added keys are masked out below and
-            # the added queries are dropped again at the end
-            Q = F.pad(Q, (0, 0, 0, padding))
-            K = F.pad(K, (0, 0, 0, padding))
-            V = F.pad(V, (0, 0, 0, padding))
-
-        # (Batch, Token+pad, Embedding) -> (Batch, n_head, G, L, head_dim)
+        # (Batch, Token, Embedding) -> (Batch, n_head, G, L, head_dim)
         def blocks(t):
             return t.view(Batch, G, L, self.n_head, head_dim).permute(0, 3, 1, 2, 4)
 
         Q, K, V = blocks(Q), blocks(K), blocks(V)
 
         # --- 1. local attention, each block against itself only ---------------
+        #! might need to fix the scaling factor here
         scores = torch.matmul(Q, K.transpose(-2, -1)) * (1.0 / math.sqrt(head_dim))
         allowed = self.causal_mask[:L, :L]
-        if padding:
-            # a key is real only if its global position is still inside Token;
-            # this only bites in the final block
-            real = (torch.arange(G * L, device=X.device) < Token).view(G, L)
-            allowed = allowed & real.unsqueeze(-2)  # (G, L, L)
         scores = scores.masked_fill(~allowed, float("-inf"))
         local = F.softmax(scores, dim=-1)
-        if padding:
-            # zero the rows belonging to padded queries so they contribute
-            # neither to the summary below nor to any real output position
-            local = local * real.view(G, L, 1).to(local.dtype)
 
         # --- 2. one summary vector per block ---------------------------------
         # sum the rows of each local map together: entry m is the total
@@ -195,6 +179,7 @@ class CustomAttention(BaseAttention):
         summary = local.sum(dim=-2)  # (Batch, n_head, G, L)
 
         # --- 3. attention between the blocks themselves -----------------------
+        #! might need to fix the scaling factor here
         global_scores = torch.matmul(summary, summary.transpose(-2, -1)) * (1.0 / math.sqrt(L))
         global_scores = global_scores.masked_fill(~self.causal_mask[:G, :G], float("-inf"))
         glob = F.softmax(global_scores, dim=-1)  # (Batch, n_head, G, G)
@@ -212,8 +197,6 @@ class CustomAttention(BaseAttention):
         y = _ScaledBlockCombine.apply(local, glob, V)  # (Batch, n_head, G, L, head_dim)
 
         y = y.permute(0, 2, 3, 1, 4).reshape(Batch, G * L, Embedding)
-        if padding:
-            y = y[:, :Token]
         y = self.c_proj(y)
         y = self.resid_dropout(y)
         return y
