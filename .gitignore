@@ -3,3 +3,5 @@ venv
 karpathy.py
 *.bin
 out
+*.pt
+*.log
