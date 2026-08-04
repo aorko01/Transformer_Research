@@ -2,7 +2,7 @@ import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from .attention_registry import BaseAttention, register_attention
+from ..model.attention_registry import BaseAttention, register_attention
 
 @register_attention("vanilla")
 class Attention(BaseAttention):
